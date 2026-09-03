@@ -1,0 +1,614 @@
+backend\tests\use-cases\complete-edit-save-display-location.controller.integration.test.js
+/*==================================================
+    DL-8 COMPLETE EDIT SAVE
+    CONTROLLER INTEGRATION TEST
+
+    Purpose:
+    - Verify AdminCarController.updateCar()
+      integrates correctly with CompleteEditSaveUseCase.
+    - Verify the complete Edit Intent contract.
+    - Verify standard controller response wrapper.
+    - Verify authoritative Display Locations response.
+    - Verify exact no-change save leaves logical DB state unchanged.
+
+    Scope:
+    - Real MySQL database.
+    - Controller -> UseCase -> Models -> DB.
+    - Does NOT test browser/frontend execution.
+    - Does NOT test Express HTTP transport.
+
+    Important:
+    - Display Location database IDs are NOT part of
+      the logical assignment state.
+    - CompleteEditSaveUseCase.replaceForCar() may
+      delete and recreate rows, therefore DB IDs may
+      legitimately change during an exact no-change save.
+
+    Status:
+    - Working / Unconfirmed
+    - Not synced to Library.
+==================================================*/
+
+'use strict';
+
+/*==================================================
+    ENVIRONMENT
+==================================================*/
+
+require('dotenv').config({
+    path: require('path').resolve(__dirname, '../../.env')
+});
+
+/*==================================================
+    DEPENDENCIES
+==================================================*/
+
+const assert = require('node:assert/strict');
+
+const BaseModel =
+    require('../../models/base.model');
+
+const AdminCarController =
+    require('../../controllers/admin/cars/cars.controller');
+
+/*==================================================
+    TEST CONSTANTS
+==================================================*/
+
+const CAR_ID = 1;
+
+const SESSION_ID =
+    '44444444-4444-4444-8444-444444444444';
+
+/*==================================================
+    DATABASE SNAPSHOT HELPERS
+==================================================*/
+
+/*--------------------------------------------------
+    CAR SNAPSHOT
+--------------------------------------------------*/
+
+async function getCarSnapshot(
+    connection = null
+) {
+    return BaseModel.query(
+        `
+        SELECT
+            id,
+            description,
+            main_image,
+            background_image
+        FROM cars
+        WHERE id = ?
+        `,
+        [CAR_ID],
+        connection
+    );
+}
+
+/*--------------------------------------------------
+    GALLERY SNAPSHOT
+--------------------------------------------------*/
+
+async function getGallerySnapshot(
+    connection = null
+) {
+    return BaseModel.query(
+        `
+        SELECT
+            id,
+            car_id,
+            image_path,
+            sort_order
+        FROM car_gallery
+        WHERE car_id = ?
+        ORDER BY
+            sort_order ASC,
+            id ASC
+        `,
+        [CAR_ID],
+        connection
+    );
+}
+
+/*--------------------------------------------------
+    DISPLAY LOCATIONS SNAPSHOT
+--------------------------------------------------*/
+
+async function getDisplayLocationsSnapshot(
+    connection = null
+) {
+    return BaseModel.query(
+        `
+        SELECT
+            cdl.id,
+            cdl.car_id,
+            cdl.section_id,
+            ss.slug,
+            cdl.sort_order
+        FROM car_display_locations AS cdl
+        INNER JOIN site_sections AS ss
+            ON ss.id = cdl.section_id
+        WHERE cdl.car_id = ?
+        ORDER BY
+            cdl.section_id ASC,
+            cdl.sort_order ASC,
+            cdl.id ASC
+        `,
+        [CAR_ID],
+        connection
+    );
+}
+
+/*==================================================
+    DISPLAY LOCATION NORMALIZATION
+==================================================*/
+
+/*--------------------------------------------------
+    FRONTEND / LOGICAL REPRESENTATION
+
+    Converts database rows into the logical
+    Display Location contract:
+
+        {
+            location,
+            sortOrder
+        }
+
+    Database ID is intentionally excluded.
+--------------------------------------------------*/
+
+function normalizeDisplayLocations(rows) {
+    return rows.map(row => ({
+        location: row.slug,
+        sortOrder: Number(row.sort_order)
+    }));
+}
+
+/*--------------------------------------------------
+    AUTHORITATIVE BACKEND RESPONSE NORMALIZATION
+
+    CompleteEditSaveUseCase returns authoritative
+    Display Location rows using backend-oriented
+    field names.
+
+    Expected current shape:
+
+        {
+            id,
+            car_id,
+            section_id,
+            section_name,
+            section_slug,
+            sort_order
+        }
+
+    Fallbacks are retained for compatibility with
+    equivalent authoritative response naming.
+--------------------------------------------------*/
+
+function normalizeReturnedDisplayLocations(rows) {
+    return rows.map(row => ({
+        location:
+            row.section_slug ??
+            row.slug ??
+            row.location,
+
+        sortOrder:
+            Number(
+                row.sort_order ??
+                row.sortOrder
+            )
+    }));
+}
+
+/*--------------------------------------------------
+    DATABASE LOGICAL STATE NORMALIZATION
+
+    IMPORTANT:
+
+    The DB primary key "id" is intentionally excluded.
+
+    CompleteEditSaveUseCase.replaceForCar() performs:
+
+        DELETE existing assignments
+        INSERT requested assignments
+
+    Therefore the logical state can remain identical
+    while database row IDs change.
+
+    Example:
+
+        Before:
+            slider-vip / 1 / id=63
+            suv        / 1 / id=64
+
+        After:
+            slider-vip / 1 / id=65
+            suv        / 1 / id=66
+
+    This is still an unchanged logical Display Location
+    state.
+--------------------------------------------------*/
+
+function normalizeDisplayLocationDatabaseState(
+    rows
+) {
+    return rows.map(row => ({
+        car_id: Number(row.car_id),
+        section_id: Number(row.section_id),
+        slug: row.slug,
+        sort_order: Number(row.sort_order)
+    }));
+}
+
+/*==================================================
+    COMPLETE EDIT INTENT
+==================================================*/
+
+/*--------------------------------------------------
+    BUILD EXACT NO-CHANGE INTENT
+
+    Uses the current database state as the requested
+    state.
+
+    This verifies that the complete controller path
+    can process an exact no-change save.
+--------------------------------------------------*/
+
+function buildIntent(
+    gallery,
+    displayLocations
+) {
+    return {
+        /*------------------------------------------
+            CAR
+        ------------------------------------------*/
+
+        car: {},
+
+        /*------------------------------------------
+            GALLERY
+        ------------------------------------------*/
+
+        gallery: {
+            sessionId: SESSION_ID,
+
+            order:
+                gallery.map(image => ({
+                    id: Number(image.id),
+                    sort_order:
+                        Number(image.sort_order)
+                })),
+
+            deleted: [],
+
+            added: []
+        },
+
+        /*------------------------------------------
+            MAIN VEHICLE IMAGES
+        ------------------------------------------*/
+
+        mainImages: {
+            sessionId: SESSION_ID,
+
+            main_image: {
+                action: 'keep',
+                tempId: null
+            },
+
+            background_image: {
+                action: 'keep',
+                tempId: null
+            }
+        },
+
+        /*------------------------------------------
+            DISPLAY LOCATIONS
+        ------------------------------------------*/
+
+        displayLocations: {
+            locations:
+                displayLocations.map(row => ({
+                    location: row.slug,
+                    sortOrder:
+                        Number(row.sort_order)
+                }))
+        }
+    };
+}
+
+/*==================================================
+    CONTROLLER RESPONSE HARNESS
+==================================================*/
+
+/*--------------------------------------------------
+    Minimal Express-like response object.
+
+    This test intentionally invokes the controller
+    directly and therefore does not require a running
+    Express HTTP server.
+--------------------------------------------------*/
+
+function createResponseHarness() {
+    return {
+        statusCode: null,
+
+        body: null,
+
+        status(code) {
+            this.statusCode = code;
+
+            return this;
+        },
+
+        json(body) {
+            this.body = body;
+
+            return body;
+        }
+    };
+}
+
+/*==================================================
+    MAIN TEST
+==================================================*/
+
+async function run() {
+
+    console.log(
+        'DL-8 COMPLETE EDIT SAVE CONTROLLER INTEGRATION TEST'
+    );
+
+    /*================================================
+        INITIAL DATABASE SNAPSHOT
+    ================================================*/
+
+    const initialCar =
+        await getCarSnapshot();
+
+    const initialGallery =
+        await getGallerySnapshot();
+
+    const initialDisplayLocations =
+        await getDisplayLocationsSnapshot();
+
+    /*------------------------------------------------
+        BASIC PRECONDITIONS
+    ------------------------------------------------*/
+
+    assert.equal(
+        initialCar.length,
+        1,
+        `Car ${CAR_ID} must exist.`
+    );
+
+    assert.ok(
+        initialGallery.length > 0,
+        `Car ${CAR_ID} must have a permanent gallery.`
+    );
+
+    /*================================================
+        BUILD EXACT NO-CHANGE INTENT
+    ================================================*/
+
+    const intent =
+        buildIntent(
+            initialGallery,
+            initialDisplayLocations
+        );
+
+    /*================================================
+        CONTROLLER REQUEST
+    ================================================*/
+
+    const req = {
+        params: {
+            id: String(CAR_ID)
+        },
+
+        body: intent
+    };
+
+    const res =
+        createResponseHarness();
+
+    try {
+
+        /*============================================
+            CONTROLLER -> USE CASE
+        ============================================*/
+
+        await AdminCarController.updateCar(
+            req,
+            res
+        );
+
+        /*============================================
+            A
+            STANDARD CONTROLLER SUCCESS RESPONSE
+        ============================================*/
+
+        assert.equal(
+            res.statusCode,
+            200,
+            'Controller must return HTTP 200.'
+        );
+
+        assert.ok(
+            res.body,
+            'Controller response body must exist.'
+        );
+
+        assert.equal(
+            res.body.success,
+            true,
+            'Controller response success must be true.'
+        );
+
+        assert.equal(
+            res.body.message,
+            'Car updated successfully.',
+            'Controller success message is incorrect.'
+        );
+
+        assert.ok(
+            res.body.data,
+            'Controller response data must exist.'
+        );
+
+        console.log(
+            'A Controller success response: PASS'
+        );
+
+        /*============================================
+            B
+            AUTHORITATIVE DISPLAY LOCATIONS RESPONSE
+        ============================================*/
+
+        assert.ok(
+            Array.isArray(
+                res.body.data.displayLocations
+            ),
+            'Authoritative Display Locations must be an array.'
+        );
+
+        const returnedDisplayLocations =
+            normalizeReturnedDisplayLocations(
+                res.body.data.displayLocations
+            );
+
+        const expectedDisplayLocations =
+            normalizeDisplayLocations(
+                initialDisplayLocations
+            );
+
+        assert.deepEqual(
+            returnedDisplayLocations,
+            expectedDisplayLocations,
+            'Returned Display Locations must match authoritative DB state.'
+        );
+
+        console.log(
+            'B Authoritative Display Locations response: PASS'
+        );
+
+        /*============================================
+            C
+            AUTHORITATIVE CAR / GALLERY RESPONSE
+        ============================================*/
+
+        assert.ok(
+            res.body.data.car,
+            'Authoritative car data must exist.'
+        );
+
+        assert.ok(
+            Array.isArray(
+                res.body.data.gallery
+            ),
+            'Authoritative gallery must be an array.'
+        );
+
+        console.log(
+            'C Authoritative Car / Gallery response: PASS'
+        );
+
+        /*============================================
+            D
+            EXACT NO-CHANGE SAVE
+
+            Verify that the logical DB state remains
+            unchanged.
+
+            For Display Locations, database primary
+            keys are intentionally ignored because
+            replaceForCar() may recreate the rows.
+        ============================================*/
+
+        const finalCar =
+            await getCarSnapshot();
+
+        const finalGallery =
+            await getGallerySnapshot();
+
+        const finalDisplayLocations =
+            await getDisplayLocationsSnapshot();
+
+        /*--------------------------------------------
+            CAR
+        --------------------------------------------*/
+
+        assert.deepEqual(
+            finalCar,
+            initialCar,
+            'Car DB state changed during exact no-change save.'
+        );
+
+        /*--------------------------------------------
+            GALLERY
+        --------------------------------------------*/
+
+        assert.deepEqual(
+            finalGallery,
+            initialGallery,
+            'Gallery DB state changed during exact no-change save.'
+        );
+
+        /*--------------------------------------------
+            DISPLAY LOCATIONS
+
+            Compare logical state only.
+
+            Ignore:
+                cdl.id
+
+            Preserve:
+                car_id
+                section_id
+                slug
+                sort_order
+        --------------------------------------------*/
+
+        assert.deepEqual(
+            normalizeDisplayLocationDatabaseState(
+                finalDisplayLocations
+            ),
+
+            normalizeDisplayLocationDatabaseState(
+                initialDisplayLocations
+            ),
+
+            'Display Locations logical DB state changed during exact no-change save.'
+        );
+
+        console.log(
+            'D Final DB state unchanged: PASS'
+        );
+
+        /*============================================
+            FINAL RESULT
+        ============================================*/
+
+        console.log(
+            'DL-8 COMPLETE EDIT SAVE CONTROLLER INTEGRATION TEST: PASS'
+        );
+
+    } catch (error) {
+
+        console.error(
+            '\nDL-8 COMPLETE EDIT SAVE CONTROLLER INTEGRATION TEST: FAIL'
+        );
+
+        console.error(error);
+
+        process.exitCode = 1;
+    }
+}
+
+/*==================================================
+    EXECUTE
+==================================================*/
+
+run();
