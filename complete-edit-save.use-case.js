@@ -1,0 +1,3435 @@
+backend\use-cases\admin\cars\complete-edit-save.use-case.js
+/*==================================================
+    COMPLETE EDIT SAVE USE CASE V5
+
+    Cars Admin Module
+    Edit Car -> Complete Save
+
+    Responsibility:
+    - Coordinate complete edit persistence
+    - Own business transaction boundary
+    - Validate database-dependent state
+    - Promote temporary gallery assets
+    - Promote temporary main image assets
+    - Persist permanent gallery records
+    - Persist main_image / background_image
+    - Reconcile Display Locations
+    - Delete permanent gallery images
+    - Persist final gallery order
+    - Compensate promoted files on failure
+    - Cleanup promoted temporary DB records
+    - Cleanup replaced/removed permanent main images
+    - Return authoritative database state
+
+    Complete Edit Domains:
+
+        Car
+        Gallery
+        Main Vehicle Images
+        Display Locations
+
+    Main Vehicle Images Contract:
+
+        mainImages:
+        {
+            sessionId,
+
+            main_image:
+            {
+                action:
+                    keep | replace | remove,
+
+                tempId:
+                    null | string
+            },
+
+            background_image:
+            {
+                action:
+                    keep | replace | remove,
+
+                tempId:
+                    null | string
+            }
+        }
+
+    Display Locations Contract:
+
+        displayLocations:
+        {
+            locations:
+            [
+                {
+                    location:
+                        section_slug,
+
+                    sortOrder:
+                        integer
+                }
+            ]
+        }
+
+    Display Locations Persistence:
+
+        section_slug
+            ↓
+        site_sections.id
+            ↓
+        car_display_locations
+
+    Display Locations Ordered-list Contract:
+
+        INSERT
+        MOVE
+        REMOVE
+        SHIFT
+        COLLAPSE
+        POSITION NORMALIZATION
+
+    Important:
+
+    - Frontend provides Display Location intent only.
+    - Backend calculates the authoritative final state.
+    - Affected sections are locked first.
+    - Locks are acquired in deterministic
+      section_id order.
+    - All Display Location mutations happen
+      inside the existing Complete Edit transaction.
+    - Existing assignment rows are preserved
+      whenever possible.
+    - Position changes shift other cars.
+    - Removing an assignment collapses the list.
+    - Positions beyond the list become N + 1.
+    - Display Location reconciliation is independent
+      from Gallery and Main Vehicle Images.
+    - Display Locations does not affect Gallery.
+    - Display Locations does not affect Main Images.
+    - Main Images remain independent from Gallery logic.
+    - meta_image remains outside this workstream.
+    - Temporary file promotion and DB persistence share
+      the same transaction boundary.
+    - Filesystem compensation happens after rollback.
+    - Temporary DB cleanup happens only after commit.
+
+    No:
+    - Express
+    - HTTP Response
+    - Router
+    - Frontend State
+    - Upload Logic
+    - DOM Logic
+
+==================================================*/
+
+'use strict';
+
+const path =
+    require('path');
+
+const fs =
+    require('fs');
+
+const BaseModel =
+    require('../../../models/base.model');
+
+const Car =
+    require('../../../models/cars/car.model');
+
+const CarAdmin =
+    require('../../../models/cars/admin/car-admin.model');
+
+const CarGallery =
+    require('../../../models/cars/car-gallery/car-gallery.model');
+
+const CarGalleryAdmin =
+    require('../../../models/cars/car-gallery/admin/car-gallery-admin.model');
+
+const CarGalleryTemp =
+    require('../../../models/cars/car-gallery/temp/car-gallery-temp.model');
+
+const CarMainImageTemp =
+    require('../../../models/cars/main-images/temp/car-main-image-temp.model');
+
+const CarDisplayLocation =
+    require('../../../models/cars/car-display-location/car-display-location.model');
+
+const CarDisplayLocationAdmin =
+    require('../../../models/cars/car-display-location/admin/car-display-location-admin.model');
+
+const SiteSection =
+    require('../../../models/cars/site-section/site-section.model');
+
+const TemporaryGalleryStorage =
+    require('../../../utils/storage/temporary-gallery-storage');
+
+const PermanentGalleryStorage =
+    require('../../../utils/storage/permanent-gallery-storage');
+
+const TemporaryMainImageStorage =
+    require('../../../utils/storage/temporary-main-image-storage');
+
+const PermanentMainImageStorage =
+    require('../../../utils/storage/permanent-main-image-storage');
+
+/*==================================================
+    CONSTANTS
+==================================================*/
+
+const MAIN_IMAGE_SLOTS =
+    Object.freeze([
+
+        'main_image',
+
+        'background_image'
+
+    ]);
+
+const MAIN_IMAGE_ACTIONS =
+    Object.freeze([
+
+        'keep',
+
+        'replace',
+
+        'remove'
+
+    ]);
+
+/*==================================================
+    APPLICATION ERROR
+==================================================*/
+
+function createError(
+    message,
+    code
+) {
+
+    const error =
+        new Error(
+            message
+        );
+
+    error.code =
+        code;
+
+    return error;
+
+}
+
+/*==================================================
+    COMPLETE EDIT SAVE USE CASE
+==================================================*/
+
+class CompleteEditSaveUseCase {
+
+    /*==================================================
+        EXECUTE COMPLETE EDIT SAVE
+    ==================================================*/
+
+    static async execute(
+        carId,
+        intent = {}
+    ) {
+
+        this.validateIntent(
+            carId,
+            intent
+        );
+
+        const normalizedCarId =
+            Number(carId);
+
+        const carData =
+            {
+                ...(intent.car || {})
+            };
+
+        /*
+         * Main image persistence is NOT controlled
+         * by intent.car.
+         */
+
+        delete carData.main_image;
+
+        delete carData.background_image;
+
+        const gallery =
+            intent.gallery || {};
+
+        const mainImages =
+            intent.mainImages || {};
+
+        const displayLocations =
+            intent.displayLocations || {};
+
+        const sessionId =
+            gallery.sessionId;
+
+        const order =
+            Array.isArray(gallery.order)
+                ? gallery.order
+                : [];
+
+        const deleted =
+            Array.isArray(gallery.deleted)
+                ? gallery.deleted
+                : [];
+
+        const added =
+            Array.isArray(gallery.added)
+                ? gallery.added
+                : [];
+
+        const mainImageSessionId =
+            mainImages.sessionId;
+
+        /*
+         * Files promoted during this Save are tracked
+         * outside the DB transaction.
+         */
+
+        const promotedGalleryFiles = [];
+
+        const promotedMainImageFiles = [];
+
+        /*
+         * Permanent Main Image files that should be
+         * removed AFTER successful COMMIT.
+         */
+
+        const obsoleteMainImageFiles = [];
+
+        try {
+
+            await BaseModel.transaction(
+
+                async (connection) => {
+
+                    /*==========================================
+                        LOAD AUTHORITATIVE CAR STATE
+                    ==========================================*/
+
+                    const [cars] =
+                        await connection.execute(
+
+                            `
+                            SELECT
+                                id,
+                                main_image,
+                                background_image
+                            FROM cars
+                            WHERE id = ?
+                            LIMIT 1
+                            `,
+
+                            [
+                                normalizedCarId
+                            ]
+
+                        );
+
+                    if (
+                        !cars.length
+                    ) {
+
+                        throw createError(
+
+                            'Car not found.',
+
+                            'CAR_NOT_FOUND'
+
+                        );
+
+                    }
+
+                    const currentCar =
+                        cars[0];
+
+                    /*==========================================
+                        VALIDATE MAIN IMAGE SESSION
+                    ==========================================*/
+
+                    if (
+                        mainImageSessionId !==
+                        sessionId
+                    ) {
+
+                        throw createError(
+
+                            'Main Vehicle Images session does not match the Edit Session.',
+
+                            'MAIN_IMAGE_SESSION_MISMATCH'
+
+                        );
+
+                    }
+
+                    /*==========================================
+                        RESOLVE MAIN IMAGE INTENT
+                    ==========================================*/
+
+                    const resolvedMainImages =
+                        await this.prepareMainImageIntent(
+
+                            normalizedCarId,
+
+                            mainImages,
+
+                            connection
+
+                        );
+
+                    /*==========================================
+                        LOAD AUTHORITATIVE GALLERY STATE
+                    ==========================================*/
+
+                    const [galleryRows] =
+                        await connection.execute(
+
+                            `
+                            SELECT
+                                id,
+                                car_id,
+                                sort_order
+                            FROM car_gallery
+                            WHERE car_id = ?
+                            ORDER BY sort_order ASC, id ASC
+                            `,
+
+                            [
+                                normalizedCarId
+                            ]
+
+                        );
+
+                    const existingIds =
+                        new Set(
+
+                            galleryRows.map(
+                                image =>
+                                    Number(
+                                        image.id
+                                    )
+                            )
+
+                        );
+
+                    /*==========================================
+                        VALIDATE DELETE INTENT
+                    ==========================================*/
+
+                    for (
+                        const imageId
+                        of deleted
+                    ) {
+
+                        if (
+                            !existingIds.has(
+                                imageId
+                            )
+                        ) {
+
+                            throw createError(
+
+                                'Gallery delete intent contains an invalid image.',
+
+                                'INVALID_GALLERY_DELETE'
+
+                            );
+
+                        }
+
+                    }
+
+                    /*==========================================
+                        VALIDATE PERMANENT ORDER INTENT
+                    ==========================================*/
+
+                    const orderIds =
+                        order.map(
+                            item =>
+                                item.id
+                        );
+
+                    const uniqueOrderIds =
+                        new Set(
+                            orderIds
+                        );
+
+                    if (
+                        uniqueOrderIds.size !==
+                        orderIds.length
+                    ) {
+
+                        throw createError(
+
+                            'Gallery order contains duplicate image IDs.',
+
+                            'INVALID_GALLERY_ORDER'
+
+                        );
+
+                    }
+
+                    for (
+                        const item
+                        of order
+                    ) {
+
+                        if (
+                            !item ||
+                            !Number.isInteger(
+                                item.id
+                            ) ||
+                            !Number.isInteger(
+                                item.sort_order
+                            ) ||
+                            item.sort_order < 1
+                        ) {
+
+                            throw createError(
+
+                                'Gallery order contains invalid data.',
+
+                                'INVALID_GALLERY_ORDER'
+
+                            );
+
+                        }
+
+                        if (
+                            !existingIds.has(
+                                item.id
+                            )
+                        ) {
+
+                            throw createError(
+
+                                'Gallery order contains an invalid image.',
+
+                                'INVALID_GALLERY_ORDER'
+
+                            );
+
+                        }
+
+                    }
+
+                    /*==========================================
+                        VALIDATE FINAL PERMANENT SET
+                    ==========================================*/
+
+                    const deletedSet =
+                        new Set(
+                            deleted
+                        );
+
+                    const expectedRemainingIds =
+                        galleryRows
+                            .map(
+                                image =>
+                                    image.id
+                            )
+                            .filter(
+                                id =>
+                                    !deletedSet.has(
+                                        id
+                                    )
+                            );
+
+                    if (
+                        orderIds.length !==
+                        expectedRemainingIds.length
+                    ) {
+
+                        throw createError(
+
+                            'Gallery order does not represent the final gallery state.',
+
+                            'INVALID_GALLERY_ORDER'
+
+                        );
+
+                    }
+
+                    const expectedSet =
+                        new Set(
+                            expectedRemainingIds
+                        );
+
+                    for (
+                        const id
+                        of orderIds
+                    ) {
+
+                        if (
+                            !expectedSet.has(
+                                id
+                            )
+                        ) {
+
+                            throw createError(
+
+                                'Gallery order does not match the final gallery state.',
+
+                                'INVALID_GALLERY_ORDER'
+
+                            );
+
+                        }
+
+                    }
+
+                    /*==========================================
+                        VALIDATE TEMPORARY GALLERY ADDITIONS
+                    ==========================================*/
+
+                    const addedTempIds =
+                        added.map(
+                            item =>
+                                item.tempId
+                        );
+
+                    const uniqueTempIds =
+                        new Set(
+                            addedTempIds
+                        );
+
+                    if (
+                        uniqueTempIds.size !==
+                        addedTempIds.length
+                    ) {
+
+                        throw createError(
+
+                            'Gallery added contains duplicate temporary asset IDs.',
+
+                            'INVALID_GALLERY_ADDED'
+
+                        );
+
+                    }
+
+                    for (
+                        const item
+                        of added
+                    ) {
+
+                        if (
+                            !item ||
+                            typeof item.tempId !==
+                                'string' ||
+                            !item.tempId.length ||
+                            !Number.isInteger(
+                                item.sort_order
+                            ) ||
+                            item.sort_order < 1
+                        ) {
+
+                            throw createError(
+
+                                'Gallery added contains invalid data.',
+
+                                'INVALID_GALLERY_ADDED'
+
+                            );
+
+                        }
+
+                    }
+
+                    /*==========================================
+                        VALIDATE COMBINED SORT ORDER
+                    ==========================================*/
+
+                    const combinedSortOrders = [
+
+                        ...order.map(
+                            item =>
+                                item.sort_order
+                        ),
+
+                        ...added.map(
+                            item =>
+                                item.sort_order
+                        )
+
+                    ];
+
+                    const uniqueSortOrders =
+                        new Set(
+                            combinedSortOrders
+                        );
+
+                    if (
+                        uniqueSortOrders.size !==
+                        combinedSortOrders.length
+                    ) {
+
+                        throw createError(
+
+                            'Gallery final order contains duplicate sort orders.',
+
+                            'INVALID_GALLERY_ORDER'
+
+                        );
+
+                    }
+
+                    for (
+                        let sortOrder = 1;
+                        sortOrder <=
+                            combinedSortOrders.length;
+                        sortOrder++
+                    ) {
+
+                        if (
+                            !uniqueSortOrders.has(
+                                sortOrder
+                            )
+                        ) {
+
+                            throw createError(
+
+                                'Gallery final order must contain consecutive sort orders.',
+
+                                'INVALID_GALLERY_ORDER'
+
+                            );
+
+                        }
+
+                    }
+
+                    /*==========================================
+                        LOAD + VALIDATE TEMPORARY GALLERY ASSETS
+                    ==========================================*/
+
+                    const temporaryGalleryAssets = [];
+
+                    for (
+                        const item
+                        of added
+                    ) {
+
+                        const temporaryAsset =
+                            await CarGalleryTemp.findByTempId(
+
+                                item.tempId,
+
+                                connection
+
+                            );
+
+                        if (
+                            !temporaryAsset
+                        ) {
+
+                            throw createError(
+
+                                'Temporary gallery asset was not found.',
+
+                                'TEMP_ASSET_NOT_FOUND'
+
+                            );
+
+                        }
+
+                        if (
+                            Number(
+                                temporaryAsset.car_id
+                            ) !==
+                            normalizedCarId
+                        ) {
+
+                            throw createError(
+
+                                'Temporary gallery asset does not belong to this car.',
+
+                                'TEMP_ASSET_CAR_MISMATCH'
+
+                            );
+
+                        }
+
+                        if (
+                            temporaryAsset.session_id !==
+                            sessionId
+                        ) {
+
+                            throw createError(
+
+                                'Temporary gallery asset does not belong to this edit session.',
+
+                                'TEMP_ASSET_SESSION_MISMATCH'
+
+                            );
+
+                        }
+
+                        if (
+                            temporaryAsset.status !==
+                            'temporary'
+                        ) {
+
+                            throw createError(
+
+                                'Temporary gallery asset is not available for promotion.',
+
+                                'INVALID_TEMP_ASSET_STATUS'
+
+                            );
+
+                        }
+
+                        let temporaryPath;
+
+                        try {
+
+                            temporaryPath =
+                                TemporaryGalleryStorage
+                                    .resolveStoragePath(
+                                        temporaryAsset.storage_path
+                                    );
+
+                        } catch (storageError) {
+
+                            const error =
+                                createError(
+
+                                    'Temporary gallery storage path is invalid.',
+
+                                    'INVALID_TEMP_STORAGE_PATH'
+
+                                );
+
+                            error.cause =
+                                storageError;
+
+                            throw error;
+
+                        }
+
+                        const extension =
+                            path.extname(
+                                temporaryAsset.original_name
+                            );
+
+                        if (
+                            !extension
+                        ) {
+
+                            throw createError(
+
+                                'Temporary gallery asset does not have a valid file extension.',
+
+                                'INVALID_TEMP_FILE_EXTENSION'
+
+                            );
+
+                        }
+
+                        const physicalFileExists =
+                            await TemporaryGalleryStorage.fileExists(
+
+                                temporaryAsset.session_id,
+
+                                temporaryAsset.temp_id,
+
+                                extension
+
+                            );
+
+                        if (
+                            !physicalFileExists
+                        ) {
+
+                            throw createError(
+
+                                'Temporary gallery physical file was not found.',
+
+                                'TEMP_FILE_NOT_FOUND'
+
+                            );
+
+                        }
+
+                        temporaryGalleryAssets.push({
+
+                            intent:
+                                item,
+
+                            asset:
+                                temporaryAsset,
+
+                            temporaryPath,
+
+                            extension
+
+                        });
+
+                    }
+
+                    /*==========================================
+                        RESOLVE DISPLAY LOCATION INTENT
+                    ==========================================*/
+
+                    const resolvedDisplayLocations =
+                        await this.prepareDisplayLocationsIntent(
+
+                            normalizedCarId,
+
+                            displayLocations,
+
+                            connection
+
+                        );
+
+                    /*==========================================
+                        PREPARE DISPLAY LOCATION RECONCILIATION
+
+                        Display Locations use ordered-list semantics.
+
+                        The backend owns:
+
+                            Insert
+                            Move
+                            Remove
+                            Shift
+                            Position normalization
+
+                        The frontend only provides intent.
+                    ==========================================*/
+
+                    const finalDisplayLocations =
+                        await this.reconcileDisplayLocations(
+
+                            normalizedCarId,
+
+                            resolvedDisplayLocations,
+
+                            connection
+
+                        );
+
+                    /*==========================================
+                        UPDATE CAR DATA
+                    ==========================================*/
+
+                    if (
+                        Object.keys(
+                            carData
+                        ).length
+                    ) {
+
+                        await CarAdmin.update(
+
+                            normalizedCarId,
+
+                            carData,
+
+                            connection
+
+                        );
+
+                    }
+
+                    /*==========================================
+                        DELETE PERMANENT GALLERY IMAGES
+                    ==========================================*/
+
+                    for (
+                        const imageId
+                        of deleted
+                    ) {
+
+                        await CarGalleryAdmin.delete(
+
+                            imageId,
+
+                            connection
+
+                        );
+
+                    }
+
+                    /*==========================================
+                        RESERVE FINAL GALLERY SORT SPACE
+                    ==========================================*/
+
+                    const remainingGalleryCount =
+                        galleryRows.length -
+                        deleted.length;
+
+                    const finalGalleryCount =
+                        order.length +
+                        added.length;
+
+                    if (
+                        remainingGalleryCount > 0
+                    ) {
+
+                        const maxExistingSortOrder =
+                            galleryRows.reduce(
+
+                                (
+                                    maximum,
+                                    image
+                                ) =>
+                                    Math.max(
+                                        maximum,
+                                        Number(
+                                            image.sort_order
+                                        )
+                                    ),
+
+                                0
+
+                            );
+
+                        const sortOrderOffset =
+                            maxExistingSortOrder +
+                            finalGalleryCount +
+                            1000;
+
+                        await connection.execute(
+
+                            `
+                            UPDATE car_gallery
+                            SET sort_order = sort_order + ?
+                            WHERE car_id = ?
+                            `,
+
+                            [
+                                sortOrderOffset,
+                                normalizedCarId
+                            ]
+
+                        );
+
+                    }
+
+                    /*==========================================
+                        PROMOTE TEMPORARY GALLERY ASSETS
+                    ==========================================*/
+
+                    const promotedGalleryItems = [];
+
+                    for (
+                        const temporaryItem
+                        of temporaryGalleryAssets
+                    ) {
+
+                        const promotion =
+                            await PermanentGalleryStorage
+                                .moveTemporaryFile(
+
+                                    temporaryItem.temporaryPath,
+
+                                    normalizedCarId,
+
+                                    temporaryItem.extension
+
+                                );
+
+                        const promotedFile = {
+
+                            temporaryPath:
+                                temporaryItem.temporaryPath,
+
+                            permanentPath:
+                                promotion.absolutePath,
+
+                            storagePath:
+                                promotion.storagePath,
+
+                            filename:
+                                promotion.filename,
+
+                            extension:
+                                temporaryItem.extension,
+
+                            tempId:
+                                temporaryItem.asset.temp_id,
+
+                            sort_order:
+                                temporaryItem.intent.sort_order
+
+                        };
+
+                        promotedGalleryFiles.push(
+                            promotedFile
+                        );
+
+                        const galleryId =
+                            await CarGallery.create(
+
+                                {
+
+                                    car_id:
+                                        normalizedCarId,
+
+                                    image_path:
+                                        promotion.storagePath,
+
+                                    sort_order:
+                                        temporaryItem.intent.sort_order
+
+                                },
+
+                                connection
+
+                            );
+
+                        promotedGalleryItems.push({
+
+                            id:
+                                Number(
+                                    galleryId
+                                ),
+
+                            sort_order:
+                                temporaryItem.intent.sort_order,
+
+                            tempId:
+                                temporaryItem.asset.temp_id
+
+                        });
+
+                    }
+
+                    /*==========================================
+                        BUILD FINAL GALLERY ORDER
+                    ==========================================*/
+
+                    const finalOrder = [
+
+                        ...order.map(
+                            item => ({
+
+                                id:
+                                    item.id,
+
+                                sort_order:
+                                    item.sort_order
+
+                            })
+                        ),
+
+                        ...promotedGalleryItems.map(
+                            item => ({
+
+                                id:
+                                    item.id,
+
+                                sort_order:
+                                    item.sort_order
+
+                            })
+                        )
+
+                    ].sort(
+
+                        (a, b) =>
+                            a.sort_order -
+                            b.sort_order
+
+                    );
+
+                    /*==========================================
+                        REORDER FINAL GALLERY
+                    ==========================================*/
+
+                    if (
+                        finalOrder.length
+                    ) {
+
+                        await CarGalleryAdmin.reorder(
+
+                            finalOrder,
+
+                            connection
+
+                        );
+
+                    }
+
+                    /*==========================================
+                        APPLY MAIN VEHICLE IMAGE CHANGES
+                    ==========================================*/
+
+                    const finalMainImageValues = {
+
+                        main_image:
+                            currentCar.main_image || null,
+
+                        background_image:
+                            currentCar.background_image || null
+
+                    };
+
+                    for (
+                        const slot
+                        of MAIN_IMAGE_SLOTS
+                    ) {
+
+                        const slotIntent =
+                            resolvedMainImages[slot];
+
+                        if (
+                            slotIntent.action ===
+                            'keep'
+                        ) {
+
+                            continue;
+
+                        }
+
+                        if (
+                            slotIntent.action ===
+                            'remove'
+                        ) {
+
+                            finalMainImageValues[slot] =
+                                null;
+
+                            if (
+                                currentCar[slot]
+                            ) {
+
+                                obsoleteMainImageFiles.push({
+
+                                    slot,
+
+                                    storagePath:
+                                        currentCar[slot]
+
+                                });
+
+                            }
+
+                            continue;
+
+                        }
+
+                        /*
+                         * replace
+                         */
+
+                        const temporaryAsset =
+                            slotIntent.asset;
+
+                        const promotion =
+                            await PermanentMainImageStorage
+                                .moveTemporaryFile(
+
+                                    temporaryAsset.temporaryPath,
+
+                                    normalizedCarId,
+
+                                    slot,
+
+                                    temporaryAsset.extension
+
+                                );
+
+                        const promotedFile = {
+
+                            tempId:
+                                temporaryAsset.asset.temp_id,
+
+                            slot,
+
+                            temporaryPath:
+                                temporaryAsset.temporaryPath,
+
+                            permanentPath:
+                                promotion.absolutePath,
+
+                            storagePath:
+                                promotion.storagePath,
+
+                            filename:
+                                promotion.filename,
+
+                            extension:
+                                temporaryAsset.extension
+
+                        };
+
+                        promotedMainImageFiles.push(
+                            promotedFile
+                        );
+
+                        if (
+                            currentCar[slot]
+                        ) {
+
+                            obsoleteMainImageFiles.push({
+
+                                slot,
+
+                                storagePath:
+                                    currentCar[slot]
+
+                            });
+
+                        }
+
+                        finalMainImageValues[slot] =
+                            promotion.storagePath;
+
+                    }
+
+                    /*==========================================
+                        PERSIST MAIN VEHICLE IMAGE PATHS
+                    ==========================================*/
+
+                    if (
+                        resolvedMainImages.hasChanges
+                    ) {
+
+                        await CarAdmin.update(
+
+                            normalizedCarId,
+
+                            {
+
+                                main_image:
+                                    finalMainImageValues.main_image,
+
+                                background_image:
+                                    finalMainImageValues.background_image
+
+                            },
+
+                            connection
+
+                        );
+
+                    }
+
+                    /*==========================================
+                        FINAL GALLERY VALIDATION
+                    ==========================================*/
+
+                    const [finalGallery] =
+                        await connection.execute(
+
+                            `
+                            SELECT
+                                id,
+                                car_id,
+                                sort_order
+                            FROM car_gallery
+                            WHERE car_id = ?
+                            ORDER BY sort_order ASC, id ASC
+                            `,
+
+                            [
+                                normalizedCarId
+                            ]
+
+                        );
+
+                    if (
+                        finalGallery.length !==
+                        finalOrder.length
+                    ) {
+
+                        throw createError(
+
+                            'Final gallery state validation failed.',
+
+                            'FINAL_GALLERY_VALIDATION_FAILED'
+
+                        );
+
+                    }
+
+                    for (
+                        let index = 0;
+                        index < finalGallery.length;
+                        index++
+                    ) {
+
+                        const actual =
+                            finalGallery[index];
+
+                        const expected =
+                            finalOrder[index];
+
+                        if (
+                            Number(
+                                actual.id
+                            ) !==
+                            Number(
+                                expected.id
+                            ) ||
+                            Number(
+                                actual.sort_order
+                            ) !==
+                            Number(
+                                expected.sort_order
+                            )
+                        ) {
+
+                            throw createError(
+
+                                'Final gallery state validation failed.',
+
+                                'FINAL_GALLERY_VALIDATION_FAILED'
+
+                            );
+
+                        }
+
+                    }
+
+                    /*==========================================
+                        FINAL MAIN IMAGE VALIDATION
+                    ==========================================*/
+
+                    const [finalCars] =
+                        await connection.execute(
+
+                            `
+                            SELECT
+                                id,
+                                main_image,
+                                background_image
+                            FROM cars
+                            WHERE id = ?
+                            LIMIT 1
+                            `,
+
+                            [
+                                normalizedCarId
+                            ]
+
+                        );
+
+                    if (
+                        !finalCars.length
+                    ) {
+
+                        throw createError(
+
+                            'Final car state validation failed.',
+
+                            'FINAL_CAR_VALIDATION_FAILED'
+
+                        );
+
+                    }
+
+                    const finalCar =
+                        finalCars[0];
+
+                    if (
+                        finalCar.main_image !==
+                        finalMainImageValues.main_image
+                    ) {
+
+                        throw createError(
+
+                            'Final main image state validation failed.',
+
+                            'FINAL_MAIN_IMAGE_VALIDATION_FAILED'
+
+                        );
+
+                    }
+
+                    if (
+                        finalCar.background_image !==
+                        finalMainImageValues.background_image
+                    ) {
+
+                        throw createError(
+
+                            'Final background image state validation failed.',
+
+                            'FINAL_MAIN_IMAGE_VALIDATION_FAILED'
+
+                        );
+
+                    }
+
+                    /*==========================================
+                        FINAL DISPLAY LOCATIONS VALIDATION
+                    ==========================================*/
+
+                    const authoritativeDisplayLocations =
+                        await CarDisplayLocation.getByCarId(
+
+                            normalizedCarId,
+
+                            connection
+
+                        );
+
+                    const expectedDisplayLocationKeys =
+                        new Set(
+
+                            finalDisplayLocations.map(
+                                assignment =>
+                                    `${Number(assignment.section_id)}:${Number(assignment.sort_order)}`
+                            )
+
+                        );
+
+                    const actualDisplayLocationKeys =
+                        new Set(
+
+                            authoritativeDisplayLocations.map(
+                                assignment =>
+                                    `${Number(assignment.section_id)}:${Number(assignment.sort_order)}`
+                            )
+
+                        );
+
+                    if (
+                        expectedDisplayLocationKeys.size !==
+                        actualDisplayLocationKeys.size
+                    ) {
+
+                        throw createError(
+
+                            'Final Display Locations state validation failed.',
+
+                            'FINAL_DISPLAY_LOCATIONS_VALIDATION_FAILED'
+
+                        );
+
+                    }
+
+                    for (
+                        const key
+                        of expectedDisplayLocationKeys
+                    ) {
+
+                        if (
+                            !actualDisplayLocationKeys.has(
+                                key
+                            )
+                        ) {
+
+                            throw createError(
+
+                                'Final Display Locations state validation failed.',
+
+                                'FINAL_DISPLAY_LOCATIONS_VALIDATION_FAILED'
+
+                            );
+
+                        }
+
+                    }
+
+                    /*
+                     * Temporary DB records are intentionally
+                     * NOT deleted here.
+                     *
+                     * Cleanup happens only after COMMIT.
+                     */
+
+                    return true;
+
+                }
+
+            );
+
+        } catch (error) {
+
+            /*==============================================
+                GALLERY FILESYSTEM COMPENSATION
+            ==============================================*/
+
+            const compensationErrors = [];
+
+            for (
+                let index =
+                    promotedGalleryFiles.length - 1;
+                index >= 0;
+                index--
+            ) {
+
+                const promotedFile =
+                    promotedGalleryFiles[index];
+
+                try {
+
+                    await PermanentGalleryStorage
+                        .restoreTemporaryFile(
+
+                            promotedFile.permanentPath,
+
+                            promotedFile.temporaryPath
+
+                        );
+
+                } catch (compensationError) {
+
+                    compensationErrors.push(
+                        compensationError
+                    );
+
+                }
+
+            }
+
+            /*==============================================
+                MAIN IMAGE FILESYSTEM COMPENSATION
+            ==============================================*/
+
+            for (
+                let index =
+                    promotedMainImageFiles.length - 1;
+                index >= 0;
+                index--
+            ) {
+
+                const promotedFile =
+                    promotedMainImageFiles[index];
+
+                try {
+
+                    await PermanentMainImageStorage
+                        .restoreTemporaryFile(
+
+                            promotedFile.permanentPath,
+
+                            promotedFile.temporaryPath
+
+                        );
+
+                } catch (compensationError) {
+
+                    compensationErrors.push(
+                        compensationError
+                    );
+
+                }
+
+            }
+
+            if (
+                compensationErrors.length
+            ) {
+
+                error.compensationErrors =
+                    compensationErrors;
+
+            }
+
+            throw error;
+
+        }
+
+        /*==================================================
+            SUCCESSFUL COMMIT
+        ==================================================*/
+
+        const cleanupErrors = [];
+
+        /*==================================================
+            CLEANUP TEMPORARY GALLERY DB RECORDS
+        ==================================================*/
+
+        for (
+            const promotedFile
+            of promotedGalleryFiles
+        ) {
+
+            try {
+
+                await CarGalleryTemp.delete(
+
+                    promotedFile.tempId
+
+                );
+
+            } catch (cleanupError) {
+
+                cleanupErrors.push({
+
+                    domain:
+                        'gallery',
+
+                    tempId:
+                        promotedFile.tempId,
+
+                    error:
+                        cleanupError
+
+                });
+
+            }
+
+        }
+
+        /*==================================================
+            CLEANUP TEMPORARY MAIN IMAGE DB RECORDS
+        ==================================================*/
+
+        for (
+            const promotedFile
+            of promotedMainImageFiles
+        ) {
+
+            try {
+
+                await CarMainImageTemp.delete(
+
+                    promotedFile.tempId
+
+                );
+
+            } catch (cleanupError) {
+
+                cleanupErrors.push({
+
+                    domain:
+                        'main_image',
+
+                    tempId:
+                        promotedFile.tempId,
+
+                    error:
+                        cleanupError
+
+                });
+
+            }
+
+        }
+
+        /*==================================================
+            DELETE OBSOLETE PERMANENT MAIN IMAGE FILES
+        ==================================================*/
+
+        for (
+            const obsoleteFile
+            of obsoleteMainImageFiles
+        ) {
+
+            try {
+
+                await this.deleteObsoleteMainImageFile(
+
+                    obsoleteFile.storagePath
+
+                );
+
+            } catch (cleanupError) {
+
+                cleanupErrors.push({
+
+                    domain:
+                        'main_image_permanent_cleanup',
+
+                    storagePath:
+                        obsoleteFile.storagePath,
+
+                    error:
+                        cleanupError
+
+                });
+
+            }
+
+        }
+
+        /*
+         * Cleanup failure does NOT undo a committed Save.
+         */
+
+        if (
+            cleanupErrors.length
+        ) {
+
+            console.error(
+
+                'Complete Edit Save: Post-commit cleanup failed:',
+
+                cleanupErrors
+
+            );
+
+        }
+
+        /*==================================================
+            AUTHORITATIVE READ
+        ==================================================*/
+
+        const car =
+            await Car.getAdminDetails(
+
+                normalizedCarId
+
+            );
+
+        if (
+            !car
+        ) {
+
+            throw createError(
+
+                'Car could not be loaded after successful save.',
+
+                'AUTHORITATIVE_CAR_READ_FAILED'
+
+            );
+
+        }
+
+        const authoritativeGallery =
+            await CarGallery.getByCarId(
+
+                normalizedCarId
+
+            );
+
+        const authoritativeDisplayLocations =
+            await CarDisplayLocation.getByCarId(
+
+                normalizedCarId
+
+            );
+
+        /*==================================================
+            AUTHORITATIVE RESPONSE
+        ==================================================*/
+
+        return {
+
+            car,
+
+            gallery:
+                authoritativeGallery,
+
+            displayLocations:
+                authoritativeDisplayLocations
+
+        };
+
+    }
+
+    /*==================================================
+        RECONCILE DISPLAY LOCATIONS
+
+        Ordered-list semantics:
+
+            INSERT
+            MOVE
+            REMOVE
+            SHIFT
+            COLLAPSE
+            POSITION NORMALIZATION
+
+        Important:
+
+        - Frontend provides intent only.
+        - Backend calculates final state.
+        - All affected sections are locked first.
+        - Locks are acquired in deterministic
+          section_id order.
+        - Everything runs inside the existing
+          Complete Edit transaction.
+    ==================================================*/
+
+    static async reconcileDisplayLocations(
+        carId,
+        resolvedDisplayLocations,
+        connection
+    ) {
+
+        /*
+         * Load the current assignments of this car.
+         *
+         * This is required because a section that is
+         * no longer requested must also be processed:
+         *
+         *     REMOVE
+         *         ↓
+         *     COLLAPSE
+         */
+        const currentCarLocations =
+            await CarDisplayLocation.getByCarId(
+
+                carId,
+
+                connection
+
+            );
+
+        /*
+         * Build requested state by section.
+         */
+        const requestedBySection =
+            new Map();
+
+        for (
+            const assignment
+            of resolvedDisplayLocations
+        ) {
+
+            requestedBySection.set(
+
+                Number(
+                    assignment.section_id
+                ),
+
+                {
+
+                    section_id:
+                        Number(
+                            assignment.section_id
+                        ),
+
+                    requested_sort_order:
+                        Number(
+                            assignment.sort_order
+                        )
+
+                }
+
+            );
+
+        }
+
+        /*
+         * Affected sections are the UNION of:
+         *
+         *     current sections
+         *     requested sections
+         *
+         * This is essential for removals.
+         */
+        const affectedSectionIds =
+            new Set();
+
+        for (
+            const location
+            of currentCarLocations
+        ) {
+
+            affectedSectionIds.add(
+
+                Number(
+                    location.section_id
+                )
+
+            );
+
+        }
+
+        for (
+            const assignment
+            of resolvedDisplayLocations
+        ) {
+
+            affectedSectionIds.add(
+
+                Number(
+                    assignment.section_id
+                )
+
+            );
+
+        }
+
+        /*
+         * Deterministic lock order.
+         */
+        const sortedSectionIds =
+            Array.from(
+                affectedSectionIds
+            ).sort(
+
+                (a, b) =>
+                    a - b
+
+            );
+
+        /*
+         * Lock every affected section row.
+         *
+         * This is the serialization boundary for
+         * Display Location mutations.
+         */
+        for (
+            const sectionId
+            of sortedSectionIds
+        ) {
+
+            const section =
+                await SiteSection.getByIdForUpdate(
+
+                    sectionId,
+
+                    connection
+
+                );
+
+            if (
+                !section
+            ) {
+
+                throw createError(
+
+                    'Display Location section was not found.',
+
+                    'DISPLAY_LOCATION_SECTION_NOT_FOUND'
+
+                );
+
+            }
+
+        }
+
+        /*
+         * Read all affected section lists AFTER
+         * acquiring all locks.
+         */
+        const sectionStates =
+            new Map();
+
+        for (
+            const sectionId
+            of sortedSectionIds
+        ) {
+
+            const rows =
+                await CarDisplayLocation
+                    .getBySectionId(
+
+                        sectionId,
+
+                        connection
+
+                    );
+
+            /*
+             * Normalize numeric DB values while
+             * preserving row identity.
+             */
+            const normalizedRows =
+                rows.map(
+
+                    row => ({
+
+                        id:
+                            Number(
+                                row.id
+                            ),
+
+                        car_id:
+                            Number(
+                                row.car_id
+                            ),
+
+                        section_id:
+                            Number(
+                                row.section_id
+                            ),
+
+                        sort_order:
+                            Number(
+                                row.sort_order
+                            )
+
+                    })
+
+                );
+
+            sectionStates.set(
+
+                sectionId,
+
+                normalizedRows
+
+            );
+
+        }
+
+        /*
+         * Build final ordered state for every affected
+         * section in memory.
+         */
+        for (
+            const sectionId
+            of sortedSectionIds
+        ) {
+
+            const rows =
+                sectionStates.get(
+                    sectionId
+                ) || [];
+
+            const requested =
+                requestedBySection.get(
+                    sectionId
+                ) || null;
+
+            /*
+             * Remove the current car from the list first.
+             *
+             * This makes MOVE equivalent to:
+             *
+             *     REMOVE old position
+             *     INSERT new position
+             */
+            const currentRow =
+                rows.find(
+
+                    row =>
+                        row.car_id === carId
+
+                ) || null;
+
+            const remainingRows =
+                rows.filter(
+
+                    row =>
+                        row.car_id !== carId
+
+                );
+
+            /*
+             * If the car is not requested in this
+             * section anymore:
+             *
+             *     REMOVE
+             *     COLLAPSE
+             */
+            if (
+                !requested
+            ) {
+
+                sectionStates.set(
+
+                    sectionId,
+
+                    remainingRows.map(
+
+                        (
+                            row,
+                            index
+                        ) => ({
+
+                            ...row,
+
+                            sort_order:
+                                index + 1
+
+                        })
+
+                    )
+
+                );
+
+                continue;
+
+            }
+
+            /*
+             * Requested position is an INSERT position.
+             *
+             * Valid positions are:
+             *
+             *     1 ... remainingRows.length + 1
+             *
+             * Anything beyond the end becomes:
+             *
+             *     remainingRows.length + 1
+             */
+            const requestedPosition =
+                requested.requested_sort_order;
+
+            const normalizedPosition =
+                Math.min(
+
+                    Math.max(
+
+                        requestedPosition,
+
+                        1
+
+                    ),
+
+                    remainingRows.length + 1
+
+                );
+
+            /*
+             * Preserve the existing row identity when
+             * the car already belongs to this section.
+             */
+            const carRow =
+                currentRow || {
+
+                    id:
+                        null,
+
+                    car_id:
+                        carId,
+
+                    section_id:
+                        sectionId
+
+                };
+
+            /*
+             * Array index is zero-based while
+             * sort_order is one-based.
+             */
+            remainingRows.splice(
+
+                normalizedPosition - 1,
+
+                0,
+
+                carRow
+
+            );
+
+            /*
+             * Renumber the complete section:
+             *
+             *     1 ... N
+             */
+            const finalRows =
+                remainingRows.map(
+
+                    (
+                        row,
+                        index
+                    ) => ({
+
+                        ...row,
+
+                        sort_order:
+                            index + 1
+
+                    })
+
+                );
+
+            sectionStates.set(
+
+                sectionId,
+
+                finalRows
+
+            );
+
+        }
+
+        /*
+         * Persist the calculated final state.
+         *
+         * Existing rows are updated.
+         * New row for this car is inserted.
+         * Removed row is deleted.
+         *
+         * Other cars therefore receive their
+         * calculated shifted positions.
+         */
+        for (
+            const sectionId
+            of sortedSectionIds
+        ) {
+
+            const originalRows =
+                await CarDisplayLocation
+                    .getBySectionId(
+
+                        sectionId,
+
+                        connection
+
+                    );
+
+            const originalById =
+                new Map();
+
+            for (
+                const row
+                of originalRows
+            ) {
+
+                originalById.set(
+
+                    Number(
+                        row.id
+                    ),
+
+                    row
+
+                );
+
+            }
+
+            const finalRows =
+                sectionStates.get(
+                    sectionId
+                ) || [];
+
+            const finalIds =
+                new Set();
+
+            for (
+                const row
+                of finalRows
+            ) {
+
+                /*
+                 * Existing assignment.
+                 */
+                if (
+                    row.id !== null
+                ) {
+
+                    const rowId =
+                        Number(
+                            row.id
+                        );
+
+                    finalIds.add(
+                        rowId
+                    );
+
+                    const originalRow =
+                        originalById.get(
+                            rowId
+                        );
+
+                    if (
+                        !originalRow ||
+                        Number(
+                            originalRow.sort_order
+                        ) !==
+                        Number(
+                            row.sort_order
+                        )
+                    ) {
+
+                        await CarDisplayLocationAdmin
+                            .update(
+
+                                rowId,
+
+                                {
+
+                                    sort_order:
+                                        row.sort_order
+
+                                },
+
+                                connection
+
+                            );
+
+                    }
+
+                    continue;
+
+                }
+
+                /*
+                 * New assignment for this car.
+                 */
+                await CarDisplayLocationAdmin.create(
+
+                    {
+
+                        car_id:
+                            carId,
+
+                        section_id:
+                            sectionId,
+
+                        sort_order:
+                            row.sort_order
+
+                    },
+
+                    connection
+
+                );
+
+            }
+
+            /*
+             * Delete the old row when the car has been
+             * removed from this section.
+             */
+            for (
+                const originalRow
+                of originalRows
+            ) {
+
+                const originalId =
+                    Number(
+                        originalRow.id
+                    );
+
+                if (
+                    !finalIds.has(
+                        originalId
+                    )
+                ) {
+
+                    /*
+                     * Only the current car should normally
+                     * disappear. If another row disappears,
+                     * that indicates an unexpected state.
+                     */
+                    if (
+                        Number(
+                            originalRow.car_id
+                        ) === carId
+                    ) {
+
+                        await CarDisplayLocationAdmin
+                            .delete(
+
+                                originalId,
+
+                                connection
+
+                            );
+
+                    }
+
+                }
+
+            }
+
+        }
+
+        /*
+         * Return authoritative final assignments
+         * for the current car inside the transaction.
+         */
+        return CarDisplayLocation.getByCarId(
+
+            carId,
+
+            connection
+
+        );
+
+    }
+
+    /*==================================================
+        PREPARE DISPLAY LOCATIONS INTENT
+    ==================================================*/
+
+    static async prepareDisplayLocationsIntent(
+
+        carId,
+
+        displayLocations,
+
+        connection
+
+    ) {
+
+        if (
+            !displayLocations ||
+            typeof displayLocations !== 'object' ||
+            Array.isArray(displayLocations)
+        ) {
+
+            throw createError(
+
+                'Display Locations edit data is required.',
+
+                'INVALID_DISPLAY_LOCATIONS_INTENT'
+
+            );
+
+        }
+
+        const locations =
+            displayLocations.locations;
+
+        if (
+            !Array.isArray(locations)
+        ) {
+
+            throw createError(
+
+                'Display Locations must contain a locations array.',
+
+                'INVALID_DISPLAY_LOCATIONS'
+
+            );
+
+        }
+
+        const assignments = [];
+
+        const sectionSlugs =
+            new Set();
+
+        for (
+            const item
+            of locations
+        ) {
+
+            if (
+                !item ||
+                typeof item !== 'object' ||
+                Array.isArray(item)
+            ) {
+
+                throw createError(
+
+                    'Display Locations contains invalid assignment data.',
+
+                    'INVALID_DISPLAY_LOCATION_ASSIGNMENT'
+
+                );
+
+            }
+
+            if (
+                typeof item.location !== 'string' ||
+                !item.location.trim()
+            ) {
+
+                throw createError(
+
+                    'Display Location section slug is required.',
+
+                    'INVALID_DISPLAY_LOCATION_SECTION'
+
+                );
+
+            }
+
+            const sectionSlug =
+                item.location.trim();
+
+            if (
+                sectionSlugs.has(
+                    sectionSlug
+                )
+            ) {
+
+                throw createError(
+
+                    'Display Locations contains duplicate sections.',
+
+                    'DUPLICATE_DISPLAY_LOCATION_SECTION'
+
+                );
+
+            }
+
+            sectionSlugs.add(
+                sectionSlug
+            );
+
+            const sortOrder =
+                item.sortOrder;
+
+            if (
+                !Number.isInteger(
+                    sortOrder
+                ) ||
+                sortOrder < 1
+            ) {
+
+                throw createError(
+
+                    'Display Location sort order must be a positive integer.',
+
+                    'INVALID_DISPLAY_LOCATION_SORT_ORDER'
+
+                );
+
+            }
+
+            const section =
+                await SiteSection.getBySlug(
+
+                    sectionSlug,
+
+                    connection
+
+                );
+
+            if (
+                !section
+            ) {
+
+                throw createError(
+
+                    `Display Location section "${sectionSlug}" was not found.`,
+
+                    'DISPLAY_LOCATION_SECTION_NOT_FOUND'
+
+                );
+
+            }
+
+            assignments.push({
+
+                section_id:
+                    Number(
+                        section.id
+                    ),
+
+                sort_order:
+                    sortOrder
+
+            });
+
+        }
+
+        return assignments;
+
+    }
+
+    /*==================================================
+        PREPARE MAIN IMAGE INTENT
+    ==================================================*/
+
+    static async prepareMainImageIntent(
+
+        carId,
+
+        mainImages,
+
+        connection
+
+    ) {
+
+        const result = {
+
+            sessionId:
+                mainImages.sessionId,
+
+            hasChanges:
+                false,
+
+            main_image: {
+
+                action:
+                    mainImages.main_image.action,
+
+                asset:
+                    null
+
+            },
+
+            background_image: {
+
+                action:
+                    mainImages.background_image.action,
+
+                asset:
+                    null
+
+            }
+
+        };
+
+        const tempIds =
+            new Set();
+
+        for (
+            const slot
+            of MAIN_IMAGE_SLOTS
+        ) {
+
+            const slotIntent =
+                mainImages[slot];
+
+            if (
+                slotIntent.action ===
+                'keep'
+            ) {
+
+                continue;
+
+            }
+
+            result.hasChanges =
+                true;
+
+            if (
+                slotIntent.action ===
+                'remove'
+            ) {
+
+                continue;
+
+            }
+
+            if (
+                tempIds.has(
+                    slotIntent.tempId
+                )
+            ) {
+
+                throw createError(
+
+                    'The same temporary Main Image asset cannot be used for multiple slots.',
+
+                    'DUPLICATE_MAIN_IMAGE_TEMP_ID'
+
+                );
+
+            }
+
+            tempIds.add(
+                slotIntent.tempId
+            );
+
+            const temporaryAsset =
+                await CarMainImageTemp.findByTempId(
+
+                    slotIntent.tempId,
+
+                    connection
+
+                );
+
+            if (
+                !temporaryAsset
+            ) {
+
+                throw createError(
+
+                    'Temporary Main Image asset was not found.',
+
+                    'MAIN_IMAGE_TEMP_NOT_FOUND'
+
+                );
+
+            }
+
+            if (
+                Number(
+                    temporaryAsset.car_id
+                ) !==
+                carId
+            ) {
+
+                throw createError(
+
+                    'Temporary Main Image asset does not belong to this car.',
+
+                    'MAIN_IMAGE_TEMP_CAR_MISMATCH'
+
+                );
+
+            }
+
+            if (
+                temporaryAsset.session_id !==
+                mainImages.sessionId
+            ) {
+
+                throw createError(
+
+                    'Temporary Main Image asset does not belong to this edit session.',
+
+                    'MAIN_IMAGE_TEMP_SESSION_MISMATCH'
+
+                );
+
+            }
+
+            if (
+                temporaryAsset.slot !==
+                slot
+            ) {
+
+                throw createError(
+
+                    'Temporary Main Image asset does not belong to the requested slot.',
+
+                    'MAIN_IMAGE_TEMP_SLOT_MISMATCH'
+
+                );
+
+            }
+
+            if (
+                temporaryAsset.status !==
+                'temporary'
+            ) {
+
+                throw createError(
+
+                    'Temporary Main Image asset is not available for promotion.',
+
+                    'INVALID_MAIN_IMAGE_TEMP_STATUS'
+
+                );
+
+            }
+
+            let temporaryPath;
+
+            try {
+
+                temporaryPath =
+                    TemporaryMainImageStorage
+                        .resolveStoragePath(
+
+                            temporaryAsset.storage_path
+
+                        );
+
+            } catch (storageError) {
+
+                const error =
+                    createError(
+
+                        'Temporary Main Image storage path is invalid.',
+
+                        'INVALID_MAIN_IMAGE_TEMP_STORAGE_PATH'
+
+                    );
+
+                error.cause =
+                    storageError;
+
+                throw error;
+
+            }
+
+            const extension =
+                path.extname(
+                    temporaryAsset.storage_path
+                );
+
+            if (
+                !extension
+            ) {
+
+                throw createError(
+
+                    'Temporary Main Image file extension is invalid.',
+
+                    'INVALID_MAIN_IMAGE_TEMP_EXTENSION'
+
+                );
+
+            }
+
+            try {
+
+                await fs.promises.access(
+
+                    temporaryPath,
+
+                    fs.constants.F_OK
+
+                );
+
+            } catch {
+
+                throw createError(
+
+                    'Temporary Main Image physical file was not found.',
+
+                    'MAIN_IMAGE_TEMP_FILE_NOT_FOUND'
+
+                );
+
+            }
+
+            result[slot].asset = {
+
+                asset:
+                    temporaryAsset,
+
+                temporaryPath,
+
+                extension
+
+            };
+
+        }
+
+        return result;
+
+    }
+
+    /*==================================================
+        DELETE OBSOLETE MAIN IMAGE FILE
+    ==================================================*/
+
+    static async deleteObsoleteMainImageFile(
+        storagePath
+    ) {
+
+        if (
+            typeof storagePath !== 'string' ||
+            !storagePath.trim()
+        ) {
+
+            return false;
+
+        }
+
+        const absolutePath =
+            PermanentMainImageStorage
+                .resolveStoragePath(
+                    storagePath
+                );
+
+        return PermanentMainImageStorage
+            .deleteAbsoluteFile(
+                absolutePath
+            );
+
+    }
+
+    /*==================================================
+        REQUEST / INTENT STRUCTURE VALIDATION
+    ==================================================*/
+
+    static validateIntent(
+        carId,
+        intent
+    ) {
+
+        /*==============================================
+            CAR ID
+        ==============================================*/
+
+        if (
+            carId === undefined ||
+            carId === null ||
+            !Number.isInteger(
+                Number(carId)
+            ) ||
+            Number(carId) < 1
+        ) {
+
+            throw createError(
+
+                'A valid car ID is required.',
+
+                'INVALID_CAR_ID'
+
+            );
+
+        }
+
+        /*==============================================
+            INTENT
+        ==============================================*/
+
+        if (
+            !intent ||
+            typeof intent !== 'object' ||
+            Array.isArray(intent)
+        ) {
+
+            throw createError(
+
+                'Complete edit intent is required.',
+
+                'INVALID_EDIT_INTENT'
+
+            );
+
+        }
+
+        /*==============================================
+            CAR
+        ==============================================*/
+
+        if (
+            intent.car === undefined ||
+            intent.car === null ||
+            typeof intent.car !== 'object' ||
+            Array.isArray(intent.car)
+        ) {
+
+            throw createError(
+
+                'Car edit data is required.',
+
+                'INVALID_CAR_INTENT'
+
+            );
+
+        }
+
+        /*==============================================
+            GALLERY
+        ==============================================*/
+
+        if (
+            intent.gallery === undefined ||
+            intent.gallery === null ||
+            typeof intent.gallery !== 'object' ||
+            Array.isArray(intent.gallery)
+        ) {
+
+            throw createError(
+
+                'Gallery edit data is required.',
+
+                'INVALID_GALLERY_INTENT'
+
+            );
+
+        }
+
+        /*==============================================
+            MAIN IMAGES
+        ==============================================*/
+
+        if (
+            intent.mainImages === undefined ||
+            intent.mainImages === null ||
+            typeof intent.mainImages !== 'object' ||
+            Array.isArray(intent.mainImages)
+        ) {
+
+            throw createError(
+
+                'Main Vehicle Images edit data is required.',
+
+                'INVALID_MAIN_IMAGES_INTENT'
+
+            );
+
+        }
+
+        /*==============================================
+            DISPLAY LOCATIONS
+        ==============================================*/
+
+        if (
+            intent.displayLocations === undefined ||
+            intent.displayLocations === null ||
+            typeof intent.displayLocations !== 'object' ||
+            Array.isArray(intent.displayLocations)
+        ) {
+
+            throw createError(
+
+                'Display Locations edit data is required.',
+
+                'INVALID_DISPLAY_LOCATIONS_INTENT'
+
+            );
+
+        }
+
+        if (
+            !Array.isArray(
+                intent.displayLocations.locations
+            )
+        ) {
+
+            throw createError(
+
+                'Display Locations must contain a locations array.',
+
+                'INVALID_DISPLAY_LOCATIONS'
+
+            );
+
+        }
+
+        /*==============================================
+            SESSION ID
+        ==============================================*/
+
+        const gallerySessionId =
+            intent.gallery.sessionId;
+
+        const mainImagesSessionId =
+            intent.mainImages.sessionId;
+
+        this.validateSessionId(
+
+            gallerySessionId,
+
+            'Gallery edit session ID is required.'
+
+        );
+
+        this.validateSessionId(
+
+            mainImagesSessionId,
+
+            'Main Vehicle Images edit session ID is required.'
+
+        );
+
+        if (
+            gallerySessionId !==
+            mainImagesSessionId
+        ) {
+
+            throw createError(
+
+                'Gallery and Main Vehicle Images must use the same Edit Session ID.',
+
+                'EDIT_SESSION_MISMATCH'
+
+            );
+
+        }
+
+        /*==============================================
+            GALLERY ORDER
+        ==============================================*/
+
+        if (
+            !Array.isArray(
+                intent.gallery.order
+            )
+        ) {
+
+            throw createError(
+
+                'Gallery order must be an array.',
+
+                'INVALID_GALLERY_ORDER'
+
+            );
+
+        }
+
+        /*==============================================
+            GALLERY DELETED
+        ==============================================*/
+
+        if (
+            !Array.isArray(
+                intent.gallery.deleted
+            )
+        ) {
+
+            throw createError(
+
+                'Gallery deleted must be an array.',
+
+                'INVALID_GALLERY_DELETE'
+
+            );
+
+        }
+
+        for (
+            const imageId
+            of intent.gallery.deleted
+        ) {
+
+            if (
+                !Number.isInteger(
+                    imageId
+                ) ||
+                imageId < 1
+            ) {
+
+                throw createError(
+
+                    'Gallery deleted contains an invalid image ID.',
+
+                    'INVALID_GALLERY_DELETE'
+
+                );
+
+            }
+
+        }
+
+        /*==============================================
+            GALLERY ADDED
+        ==============================================*/
+
+        if (
+            !Array.isArray(
+                intent.gallery.added
+            )
+        ) {
+
+            throw createError(
+
+                'Gallery added must be an array.',
+
+                'INVALID_GALLERY_ADDED'
+
+            );
+
+        }
+
+        for (
+            const item
+            of intent.gallery.added
+        ) {
+
+            if (
+                !item ||
+                typeof item !== 'object' ||
+                Array.isArray(item) ||
+                typeof item.tempId !==
+                    'string' ||
+                !item.tempId.length ||
+                !Number.isInteger(
+                    item.sort_order
+                ) ||
+                item.sort_order < 1
+            ) {
+
+                throw createError(
+
+                    'Gallery added contains invalid data.',
+
+                    'INVALID_GALLERY_ADDED'
+
+                );
+
+            }
+
+        }
+
+        /*==============================================
+            MAIN IMAGE SLOT CONTRACTS
+        ==============================================*/
+
+        for (
+            const slot
+            of MAIN_IMAGE_SLOTS
+        ) {
+
+            const slotIntent =
+                intent.mainImages[slot];
+
+            if (
+                !slotIntent ||
+                typeof slotIntent !== 'object' ||
+                Array.isArray(slotIntent)
+            ) {
+
+                throw createError(
+
+                    `Main Vehicle Images slot "${slot}" is required.`,
+
+                    'INVALID_MAIN_IMAGE_SLOT_INTENT'
+
+                );
+
+            }
+
+            if (
+                !MAIN_IMAGE_ACTIONS.includes(
+                    slotIntent.action
+                )
+            ) {
+
+                throw createError(
+
+                    `Invalid Main Vehicle Images action for slot "${slot}".`,
+
+                    'INVALID_MAIN_IMAGE_ACTION'
+
+                );
+
+            }
+
+            if (
+                slotIntent.action ===
+                'replace'
+            ) {
+
+                if (
+                    typeof slotIntent.tempId !==
+                        'string' ||
+                    !slotIntent.tempId.trim()
+                ) {
+
+                    throw createError(
+
+                        `Temporary asset ID is required for Main Vehicle Images slot "${slot}".`,
+
+                        'MAIN_IMAGE_TEMP_ID_REQUIRED'
+
+                    );
+
+                }
+
+            } else {
+
+                if (
+                    slotIntent.tempId !==
+                        null &&
+                    typeof slotIntent.tempId !==
+                        'undefined'
+                ) {
+
+                    throw createError(
+
+                        `tempId must be null for Main Vehicle Images action "${slotIntent.action}".`,
+
+                        'INVALID_MAIN_IMAGE_TEMP_ID'
+
+                    );
+
+                }
+
+            }
+
+        }
+
+        /*==============================================
+            DISPLAY LOCATION STRUCTURE
+        ==============================================*/
+
+        const displayLocations =
+            intent.displayLocations.locations;
+
+        const sectionSlugs =
+            new Set();
+
+        for (
+            const item
+            of displayLocations
+        ) {
+
+            if (
+                !item ||
+                typeof item !== 'object' ||
+                Array.isArray(item)
+            ) {
+
+                throw createError(
+
+                    'Display Locations contains invalid assignment data.',
+
+                    'INVALID_DISPLAY_LOCATION_ASSIGNMENT'
+
+                );
+
+            }
+
+            if (
+                typeof item.location !== 'string' ||
+                !item.location.trim()
+            ) {
+
+                throw createError(
+
+                    'Display Location section slug is required.',
+
+                    'INVALID_DISPLAY_LOCATION_SECTION'
+
+                );
+
+            }
+
+            const location =
+                item.location.trim();
+
+            if (
+                sectionSlugs.has(
+                    location
+                )
+            ) {
+
+                throw createError(
+
+                    'Display Locations contains duplicate sections.',
+
+                    'DUPLICATE_DISPLAY_LOCATION_SECTION'
+
+                );
+
+            }
+
+            sectionSlugs.add(
+                location
+            );
+
+            if (
+                !Number.isInteger(
+                    item.sortOrder
+                ) ||
+                item.sortOrder < 1
+            ) {
+
+                throw createError(
+
+                    'Display Location sort order must be a positive integer.',
+
+                    'INVALID_DISPLAY_LOCATION_SORT_ORDER'
+
+                );
+
+            }
+
+        }
+
+    }
+
+    /*==================================================
+        SESSION VALIDATION
+    ================================================*/
+
+    static validateSessionId(
+        sessionId,
+        message
+    ) {
+
+        if (
+            typeof sessionId !== 'string' ||
+            !sessionId.trim()
+        ) {
+
+            throw createError(
+
+                message,
+
+                'INVALID_GALLERY_SESSION'
+
+            );
+
+        }
+
+        const uuidPattern =
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+        if (
+            !uuidPattern.test(
+                sessionId
+            )
+        ) {
+
+            throw createError(
+
+                'Edit Session ID has an invalid format.',
+
+                'INVALID_GALLERY_SESSION'
+
+            );
+
+        }
+
+    }
+
+}
+
+/*==================================================
+    EXPORT
+==================================================*/
+
+module.exports =
+    CompleteEditSaveUseCase;
