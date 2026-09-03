@@ -1,0 +1,45 @@
+DROP TABLE IF EXISTS site_sections;
+
+CREATE TABLE site_sections (
+
+    -- Primary Key
+    id INT UNSIGNED AUTO_INCREMENT,
+
+    -- Section Information
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) NOT NULL,
+    description TEXT DEFAULT NULL,
+
+    -- Display
+    display_order INT UNSIGNED NOT NULL DEFAULT 0,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+
+    -- Management
+    created_by INT UNSIGNED DEFAULT NULL,
+    updated_by INT UNSIGNED DEFAULT NULL,
+
+    -- Timestamps
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    -- Primary Key
+    CONSTRAINT pk_site_sections
+        PRIMARY KEY (id),
+
+    -- Unique
+    CONSTRAINT uq_site_sections_name
+        UNIQUE (name),
+
+    CONSTRAINT uq_site_sections_slug
+        UNIQUE (slug),
+
+    -- Indexes
+    INDEX idx_site_sections_active (is_active),
+    INDEX idx_site_sections_display_order (display_order),
+    INDEX idx_site_sections_created_by (created_by),
+    INDEX idx_site_sections_updated_by (updated_by)
+
+) ENGINE=InnoDB
+DEFAULT CHARSET=utf8mb4
+COLLATE=utf8mb4_unicode_ci;
