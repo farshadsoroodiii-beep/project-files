@@ -1,0 +1,883 @@
+backend\tests\use-cases\complete-edit-save-display-location.persistence-edge-cases.integration.test.js
+/*==================================================
+    DL-7-B REAL DB PERSISTENCE EDGE CASES TEST
+
+    Production files are NOT modified.
+
+    Purpose:
+    - Verify Display Location persistence edge cases
+      against the real MySQL database.
+    - Verify empty Display Location selection.
+    - Verify same sortOrder across different sections
+      during a real persistence operation.
+    - Verify complete replacement of assignments.
+    - Verify no-change save preserves logical state.
+    - Restore the original DB state after the test.
+
+    Test DB:
+        projectcar
+
+    Test car:
+        car 1 (Tiggo 9)
+
+    Scenarios:
+        A) Empty selection
+        B) Same sortOrder in different sections
+           with real DB persistence
+        C) Multiple-location replacement
+        D) Exact no-change save
+
+    Important:
+        The original Display Location state is restored
+        at the end of the test.
+
+==================================================*/
+
+'use strict';
+
+/*==================================================
+    ENVIRONMENT
+==================================================*/
+
+require('dotenv').config({
+    path: require('path').resolve(
+        __dirname,
+        '../../.env'
+    )
+});
+
+/*==================================================
+    DEPENDENCIES
+==================================================*/
+
+const assert =
+    require('node:assert/strict');
+
+const BaseModel =
+    require('../../models/base.model');
+
+const CompleteEditSaveUseCase =
+    require(
+        '../../use-cases/admin/cars/complete-edit-save.use-case'
+    );
+
+/*==================================================
+    TEST CONFIG
+==================================================*/
+
+const CAR_ID = 1;
+
+const SESSION_ID =
+    '33333333-3333-4333-8333-333333333333';
+
+/*==================================================
+    READ DISPLAY LOCATIONS
+==================================================*/
+
+async function getLocations(carId) {
+
+    return BaseModel.query(
+
+        `
+        SELECT
+            cdl.id,
+            cdl.car_id,
+            cdl.section_id,
+            ss.slug,
+            cdl.sort_order
+
+        FROM car_display_locations cdl
+
+        INNER JOIN site_sections ss
+            ON ss.id = cdl.section_id
+
+        WHERE cdl.car_id = ?
+
+        ORDER BY
+            ss.slug ASC,
+            cdl.sort_order ASC,
+            cdl.id ASC
+        `,
+
+        [
+            carId
+        ]
+
+    );
+
+}
+
+/*==================================================
+    READ GALLERY
+
+    CompleteEditSave requires the current gallery
+    representation for a valid no-change save.
+==================================================*/
+
+async function getGallery(carId) {
+
+    return BaseModel.query(
+
+        `
+        SELECT
+            id,
+            car_id,
+            image_path,
+            sort_order
+
+        FROM car_gallery
+
+        WHERE car_id = ?
+
+        ORDER BY
+            sort_order ASC,
+            id ASC
+        `,
+
+        [
+            carId
+        ]
+
+    );
+
+}
+
+/*==================================================
+    LOGICAL DISPLAY LOCATION SNAPSHOT
+
+    Database row ID is intentionally excluded.
+
+    replaceForCar() may delete and recreate rows,
+    therefore auto-increment IDs are not part of
+    the logical Display Location state.
+==================================================*/
+
+function locationSnapshot(rows) {
+
+    return rows.map(
+
+        row => ({
+
+            section_id:
+                Number(row.section_id),
+
+            slug:
+                row.slug,
+
+            sort_order:
+                Number(row.sort_order)
+
+        })
+
+    );
+
+}
+
+/*==================================================
+    BUILD COMPLETE EDIT INTENT
+
+    The test changes only Display Locations.
+
+    Car:
+        no changes
+
+    Gallery:
+        exact current permanent order
+
+    Main Images:
+        keep current images
+
+    Display Locations:
+        scenario-specific assignments
+==================================================*/
+
+function buildIntent(
+    gallery,
+    displayLocations
+) {
+
+    return {
+
+        car: {},
+
+        gallery: {
+
+            sessionId:
+                SESSION_ID,
+
+            order:
+                gallery.map(
+
+                    image => ({
+
+                        id:
+                            Number(image.id),
+
+                        sort_order:
+                            Number(image.sort_order)
+
+                    })
+
+                ),
+
+            deleted: [],
+
+            added: []
+
+        },
+
+        mainImages: {
+
+            sessionId:
+                SESSION_ID,
+
+            main_image: {
+
+                action: 'keep',
+
+                tempId: null
+
+            },
+
+            background_image: {
+
+                action: 'keep',
+
+                tempId: null
+
+            }
+
+        },
+
+        displayLocations: {
+
+            locations:
+                displayLocations.map(
+
+                    row => ({
+
+                        location:
+                            row.slug,
+
+                        sortOrder:
+                            Number(row.sort_order)
+
+                    })
+
+                )
+
+        }
+
+    };
+
+}
+
+/*==================================================
+    BUILD LOCATION INTENT DIRECTLY FROM SLUGS
+
+    Used for scenarios where we intentionally define
+    a new logical Display Location state.
+==================================================*/
+
+function buildLocations(items) {
+
+    return items.map(
+
+        item => ({
+
+            slug:
+                item.slug,
+
+            sort_order:
+                Number(item.sort_order)
+
+        })
+
+    );
+
+}
+
+/*==================================================
+    SAVE DISPLAY LOCATION STATE
+==================================================*/
+
+async function saveLocations(
+    gallery,
+    locations
+) {
+
+    return CompleteEditSaveUseCase.execute(
+
+        CAR_ID,
+
+        buildIntent(
+            gallery,
+            locations
+        )
+
+    );
+
+}
+
+/*==================================================
+    RESTORE ORIGINAL STATE
+
+    This is a real Complete Edit Save using the
+    original logical Display Location state.
+
+    It is used only for test cleanup.
+==================================================*/
+
+async function restoreOriginalState(
+    gallery,
+    originalLocations
+) {
+
+    await saveLocations(
+        gallery,
+        originalLocations
+    );
+
+}
+
+/*==================================================
+    ASSERT LOGICAL STATE
+==================================================*/
+
+async function assertLocationsEqual(
+    expected,
+    message
+) {
+
+    const actual =
+        await getLocations(CAR_ID);
+
+    assert.deepEqual(
+
+        locationSnapshot(actual),
+
+        locationSnapshot(expected),
+
+        message
+
+    );
+
+    return actual;
+
+}
+
+/*==================================================
+    MAIN TEST
+==================================================*/
+
+async function run() {
+
+    console.log(
+        'DL-7-B REAL DB PERSISTENCE EDGE CASES TEST'
+    );
+
+    /*==============================================
+        INITIAL SNAPSHOT
+    ==============================================*/
+
+    const originalLocations =
+        await getLocations(CAR_ID);
+
+    const gallery =
+        await getGallery(CAR_ID);
+
+    assert.ok(
+
+        originalLocations.length > 0,
+
+        'Car 1 must have existing Display Locations.'
+
+    );
+
+    assert.ok(
+
+        gallery.length > 0,
+
+        'Car 1 must have a permanent gallery.'
+
+    );
+
+    const originalSnapshot =
+        locationSnapshot(originalLocations);
+
+    console.log(
+        `Initial Display Locations: ${originalSnapshot.length}`
+    );
+
+    let testError = null;
+
+    try {
+
+        /*==========================================
+            A — EMPTY SELECTION
+        ==========================================*/
+
+        await saveLocations(
+            gallery,
+            []
+        );
+
+        const afterEmpty =
+            await getLocations(CAR_ID);
+
+        assert.equal(
+
+            afterEmpty.length,
+
+            0,
+
+            'Empty Display Location selection must remove all assignments.'
+
+        );
+
+        console.log(
+            'A  Empty selection persistence: PASS'
+        );
+
+        /*==========================================
+            RESTORE ORIGINAL STATE
+        ==========================================*/
+
+        await restoreOriginalState(
+            gallery,
+            originalLocations
+        );
+
+        await assertLocationsEqual(
+
+            originalLocations,
+
+            'Original state must be restored after empty-selection scenario.'
+
+        );
+
+        /*==========================================
+            B — SAME SORT ORDER ACROSS SECTIONS
+        ==========================================
+
+            IMPORTANT:
+
+            We intentionally use sortOrder=4 for
+            both sections.
+
+            Current DB state has positions 1-3
+            occupied in these sections, so:
+
+                van  -> 4
+                truck -> 4
+
+            are free positions.
+
+            Same sortOrder across different
+            sections must be valid.
+        ==========================================*/
+
+        const sameOrderLocations =
+            buildLocations([
+
+                {
+                    slug: 'van',
+                    sort_order: 4
+                },
+
+                {
+                    slug: 'truck',
+                    sort_order: 4
+                }
+
+            ]);
+
+        await saveLocations(
+            gallery,
+            sameOrderLocations
+        );
+
+        const afterSameOrder =
+            await getLocations(CAR_ID);
+
+        assert.deepEqual(
+
+            locationSnapshot(afterSameOrder),
+
+            [
+                {
+                    section_id:
+                        Number(
+                            afterSameOrder.find(
+                                row => row.slug === 'truck'
+                            ).section_id
+                        ),
+
+                    slug: 'truck',
+
+                    sort_order: 4
+
+                },
+
+                {
+                    section_id:
+                        Number(
+                            afterSameOrder.find(
+                                row => row.slug === 'van'
+                            ).section_id
+                        ),
+
+                    slug: 'van',
+
+                    sort_order: 4
+
+                }
+
+            ].sort(
+
+                (a, b) => {
+
+                    if (a.slug < b.slug) {
+                        return -1;
+                    }
+
+                    if (a.slug > b.slug) {
+                        return 1;
+                    }
+
+                    return a.sort_order -
+                        b.sort_order;
+
+                }
+
+            ),
+
+            'Same sortOrder must persist independently per section.'
+
+        );
+
+        assert.equal(
+
+            afterSameOrder.length,
+
+            2,
+
+            'Exactly two Display Location assignments must be persisted.'
+
+        );
+
+        console.log(
+            'B  Same sortOrder across sections persistence: PASS'
+        );
+
+        /*==========================================
+            RESTORE ORIGINAL STATE
+        ==========================================*/
+
+        await restoreOriginalState(
+            gallery,
+            originalLocations
+        );
+
+        await assertLocationsEqual(
+
+            originalLocations,
+
+            'Original state must be restored after same-sortOrder scenario.'
+
+        );
+
+        /*==========================================
+            C — MULTIPLE LOCATION REPLACEMENT
+        ==========================================
+
+            New logical state:
+
+                suv   -> 9
+                truck -> 5
+                van   -> 4
+
+            These positions are intentionally outside
+            the currently occupied positions of other
+            cars in the corresponding sections.
+
+            Expected result:
+                old assignments completely replaced.
+        ==========================================*/
+
+        const replacementLocations =
+            buildLocations([
+
+                {
+                    slug: 'suv',
+                    sort_order: 9
+                },
+
+                {
+                    slug: 'truck',
+                    sort_order: 5
+                },
+
+                {
+                    slug: 'van',
+                    sort_order: 4
+                }
+
+            ]);
+
+        await saveLocations(
+            gallery,
+            replacementLocations
+        );
+
+        const afterReplacement =
+            await getLocations(CAR_ID);
+
+        const replacementSnapshot =
+            locationSnapshot(afterReplacement)
+                .sort(
+
+                    (a, b) => {
+
+                        if (a.slug < b.slug) {
+                            return -1;
+                        }
+
+                        if (a.slug > b.slug) {
+                            return 1;
+                        }
+
+                        return a.sort_order -
+                            b.sort_order;
+
+                    }
+
+                );
+
+        const expectedReplacement =
+            replacementLocations
+                .map(
+
+                    item => ({
+
+                        slug:
+                            item.slug,
+
+                        sort_order:
+                            Number(item.sort_order)
+
+                    })
+
+                )
+                .sort(
+
+                    (a, b) => {
+
+                        if (a.slug < b.slug) {
+                            return -1;
+                        }
+
+                        if (a.slug > b.slug) {
+                            return 1;
+                        }
+
+                        return a.sort_order -
+                            b.sort_order;
+
+                    }
+
+                );
+
+        assert.deepEqual(
+
+            replacementSnapshot.map(
+
+                item => ({
+
+                    slug:
+                        item.slug,
+
+                    sort_order:
+                        item.sort_order
+
+                })
+
+            ),
+
+            expectedReplacement,
+
+            'Replacement save must persist exactly the new Display Location set.'
+
+        );
+
+        assert.equal(
+
+            afterReplacement.length,
+
+            replacementLocations.length,
+
+            'Old Display Locations must not remain after replacement.'
+
+        );
+
+        console.log(
+            'C  Multiple-location replacement: PASS'
+        );
+
+        /*==========================================
+            RESTORE ORIGINAL STATE
+        ==========================================*/
+
+        await restoreOriginalState(
+            gallery,
+            originalLocations
+        );
+
+        await assertLocationsEqual(
+
+            originalLocations,
+
+            'Original state must be restored after replacement scenario.'
+
+        );
+
+        /*==========================================
+            D — NO-CHANGE SAVE
+        ==========================================
+
+            Save the exact original logical state.
+
+            Expected:
+                logical DB state unchanged.
+        ==========================================*/
+
+        await saveLocations(
+            gallery,
+            originalLocations
+        );
+
+        const afterNoChange =
+            await getLocations(CAR_ID);
+
+        assert.deepEqual(
+
+            locationSnapshot(afterNoChange),
+
+            originalSnapshot,
+
+            'No-change save must preserve the exact logical Display Location state.'
+
+        );
+
+        console.log(
+            'D  No-change save: PASS'
+        );
+
+        /*==========================================
+            FINAL STATE CHECK
+        ==========================================*/
+
+        await assertLocationsEqual(
+
+            originalLocations,
+
+            'Final DB state must equal the initial DB state.'
+
+        );
+
+        console.log(
+            'E  Final state restored / unchanged: PASS'
+        );
+
+    } catch (error) {
+
+        testError =
+            error;
+
+    } finally {
+
+        /*==========================================
+            GUARANTEED TEST CLEANUP
+        ==========================================*/
+
+        try {
+
+            await restoreOriginalState(
+                gallery,
+                originalLocations
+            );
+
+        } catch (restoreError) {
+
+            console.error(
+                'TEST CLEANUP RESTORE FAILED'
+            );
+
+            console.error(
+                'code:',
+                restoreError.code || '(none)'
+            );
+
+            console.error(
+                'message:',
+                restoreError.message
+            );
+
+            if (!testError) {
+
+                testError =
+                    restoreError;
+
+            }
+
+        }
+
+    }
+
+    /*==============================================
+        TEST FAILURE
+    ==============================================*/
+
+    if (testError) {
+
+        throw testError;
+
+    }
+
+    /*==============================================
+        FINAL PASS
+    ==============================================*/
+
+    console.log(
+        'DL-7-B REAL DB PERSISTENCE EDGE CASES TEST: PASS'
+    );
+
+}
+
+/*==================================================
+    TOP-LEVEL ERROR HANDLER
+==================================================*/
+
+run().catch(
+
+    error => {
+
+        console.error(
+            'DL-7-B REAL DB PERSISTENCE EDGE CASES TEST: FAIL'
+        );
+
+        console.error(
+            'code:',
+            error.code || '(none)'
+        );
+
+        console.error(
+            'message:',
+            error.message
+        );
+
+        process.exitCode = 1;
+
+    }
+
+);
