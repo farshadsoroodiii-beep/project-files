@@ -1,0 +1,271 @@
+admin-panel\js\modules\cars\api.js
+/*==================================================
+    CARS API MODULE
+
+    Vehicle Management API Client
+
+    Version : 1.2
+==================================================*/
+
+const CarsAPI = (() => {
+
+    const API_BASE = ADMIN_CONFIG.API_BASE;
+
+    /*==================================================
+        REQUEST HELPER
+    ==================================================*/
+
+    async function request(
+        endpoint,
+        options = {}
+    ) {
+
+        const token =
+            ADMIN_AUTH.getToken();
+
+        const isFormData =
+            options.body instanceof FormData;
+
+        const defaultHeaders = {
+
+            Authorization:
+                `Bearer ${token}`
+
+        };
+
+        /*
+         * JSON requests require an explicit
+         * Content-Type header.
+         *
+         * FormData requests must NOT define
+         * Content-Type manually because the browser
+         * must generate:
+         *
+         * multipart/form-data; boundary=...
+         *
+         * automatically.
+         */
+
+        if (!isFormData) {
+
+            defaultHeaders['Content-Type'] =
+                'application/json';
+
+        }
+
+        const config = {
+
+            method: 'GET',
+
+            headers:
+                defaultHeaders,
+
+            ...options
+
+        };
+
+        /*
+         * If caller explicitly provided headers,
+         * preserve them while keeping the FormData
+         * Content-Type rule intact.
+         */
+
+        if (
+            options.headers
+        ) {
+
+            config.headers = {
+
+                ...defaultHeaders,
+
+                ...options.headers
+
+            };
+
+            if (isFormData) {
+
+                delete config.headers['Content-Type'];
+
+                delete config.headers['content-type'];
+
+            }
+
+        }
+
+        try {
+
+            const response =
+                await fetch(
+                    `${API_BASE}${endpoint}`,
+                    config
+                );
+
+            const data =
+                await response.json();
+
+            if (
+                !response.ok ||
+                !data.success
+            ) {
+
+                throw new Error(
+
+                    data.message ||
+
+                    'API Request Failed'
+
+                );
+
+            }
+
+            return data;
+
+        }
+
+        catch(error) {
+
+            console.error(
+
+                'Cars API Error:',
+
+                error
+
+            );
+
+            throw error;
+
+        }
+
+    }
+
+    /*==================================================
+        GET CARS
+    ==================================================*/
+
+    async function getCars(options = {}) {
+
+        const {
+
+            page = 1,
+
+            limit = 10,
+
+            search = "",
+
+            brand = "",
+
+            condition = "",
+
+            status = ""
+
+        } = options;
+
+        const params =
+            new URLSearchParams();
+
+        params.set(
+            "page",
+            page
+        );
+
+        params.set(
+            "limit",
+            limit
+        );
+
+        if (search) {
+
+            params.set(
+                "search",
+                search
+            );
+
+        }
+
+        if (brand) {
+
+            params.set(
+                "brand",
+                brand
+            );
+
+        }
+
+        if (condition) {
+
+            params.set(
+                "condition",
+                condition
+            );
+
+        }
+
+        if (status) {
+
+            params.set(
+                "status",
+                status
+            );
+
+        }
+
+        const response =
+            await request(
+
+                `/admin/cars?${params.toString()}`
+
+            );
+
+        return {
+
+            cars:
+                response.data,
+
+            page:
+                response.pagination.page,
+
+            limit:
+                response.pagination.limit,
+
+            total:
+                response.pagination.total,
+
+            totalPages:
+                response.pagination.totalPages
+
+        };
+
+    }
+
+    /*==================================================
+        GET BRANDS
+    ==================================================*/
+
+    async function getBrands() {
+
+        const response =
+            await request(
+
+                '/admin/cars/brands'
+
+            );
+
+        return response.data;
+
+    }
+
+    /*==================================================
+        PUBLIC
+    ==================================================*/
+
+    return {
+
+        getCars,
+
+        getBrands,
+
+        request
+
+    };
+
+})();
