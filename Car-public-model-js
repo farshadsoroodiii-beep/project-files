@@ -1,0 +1,314 @@
+backend\models\cars\public\car-public.model.js
+/*==================================================
+    CAR PUBLIC MODEL
+    Public Website Queries
+==================================================*/
+
+const BaseModel = require('../../base.model');
+
+class CarPublic extends BaseModel {
+    /*==============================================
+        GET ACTIVE CARS
+        PUBLIC
+    ==============================================*/
+    static async getActive() {
+
+        const sql = `
+
+            SELECT
+
+                c.id,
+
+                c.brand_id,
+
+                b.name AS brand_name,
+
+                c.model,
+                c.trim,
+                c.display_title,
+
+                c.car_code,
+                c.slug,
+
+                c.condition,
+                c.status,
+
+                c.year,
+
+                c.color,
+                c.gearbox,
+                c.fuel,
+
+                c.price,
+                c.old_price,
+
+                c.currency,
+                c.price_status,
+
+                c.main_image,
+                c.background_image,
+
+                c.manufacturer_url,
+
+                c.is_active,
+
+                c.published_at
+
+            FROM cars c
+
+            INNER JOIN brands b
+
+                ON b.id = c.brand_id
+
+            WHERE
+
+                c.is_active = 1
+
+            ORDER BY
+
+                c.published_at DESC,
+
+                c.created_at DESC
+
+        `;
+
+        return this.findAll(sql);
+
+    }
+    /*==============================================
+        GET CARS BY SITE SECTION SLUG
+        FRONTEND DISPLAY
+    ==============================================*/
+    static async getBySectionSlug(slug) {
+
+        const sql = `
+
+            SELECT
+
+                c.id,
+
+                c.brand_id,
+
+                b.name AS brand_name,
+
+                c.model,
+
+                c.trim,
+
+                c.display_title,
+
+                c.slug,
+
+                c.condition,
+
+                c.status,
+
+                c.year,
+
+                c.color,
+
+                c.gearbox,
+
+                c.fuel,
+
+                c.mileage,
+
+                c.price,
+
+                c.old_price,
+
+                c.currency,
+
+                c.price_status,
+
+                c.main_image,
+
+                c.background_image,
+
+                c.manufacturer_url,
+
+                c.is_active,
+
+                c.published_at,
+
+                ss.id AS section_id,
+
+                ss.name AS section_name,
+
+                ss.slug AS section_slug,
+
+                cdl.sort_order
+
+            FROM cars c
+
+            INNER JOIN brands b
+
+                ON b.id = c.brand_id
+
+            INNER JOIN car_display_locations cdl
+
+                ON cdl.car_id = c.id
+
+            INNER JOIN site_sections ss
+
+                ON ss.id = cdl.section_id
+
+            WHERE
+
+                c.is_active = 1
+
+                AND ss.is_active = 1
+
+                AND ss.slug = ?
+
+            ORDER BY
+
+                cdl.sort_order ASC,
+
+                c.published_at DESC,
+
+                c.created_at DESC
+
+        `;
+
+        return this.findAll(
+
+            sql,
+
+            [slug]
+
+        );
+
+    }
+    /*==============================================
+        GET ADMIN DETAILS
+        ADMIN PANEL EDIT PAGE
+
+        Includes:
+
+        - Car Information
+        - Brand Information
+        - Gallery
+        - Display Locations
+
+    ==============================================*/
+    static async getAdminDetails(id) {
+
+        const carSql = `
+
+            SELECT
+
+                c.*,
+
+                b.name AS brand_name,
+
+                b.slug AS brand_slug,
+
+                b.logo AS brand_logo,
+
+                b.country AS brand_country
+
+            FROM cars c
+
+            INNER JOIN brands b
+
+                ON b.id = c.brand_id
+
+            WHERE
+
+                c.id = ?
+
+            LIMIT 1
+
+        `;
+
+        const car = await this.findOne(
+            carSql,
+            [id]
+        );
+
+        if (!car) {
+
+            return null;
+
+        }
+
+        const gallerySql = `
+
+            SELECT
+
+                id,
+
+                image_path,
+
+                sort_order
+
+            FROM car_gallery
+
+            WHERE
+
+                car_id = ?
+
+            ORDER BY
+
+                sort_order ASC,
+
+                id ASC
+
+        `;
+
+        const gallery = await this.findAll(
+            gallerySql,
+            [id]
+        );
+
+        const locationsSql = `
+
+            SELECT
+
+                cdl.id,
+
+                cdl.sort_order,
+
+                ss.id AS section_id,
+
+                ss.name AS section_name,
+
+                ss.slug AS section_slug
+
+            FROM car_display_locations cdl
+
+            INNER JOIN site_sections ss
+
+                ON ss.id = cdl.section_id
+
+            WHERE
+
+                cdl.car_id = ?
+
+            ORDER BY
+
+                cdl.sort_order ASC
+
+        `;
+
+        const locations = await this.findAll(
+            locationsSql,
+            [id]
+        );
+
+        return {
+
+            car,
+
+            gallery,
+
+            locations
+
+        };
+
+    }
+
+}
+
+module.exports = CarPublic;
