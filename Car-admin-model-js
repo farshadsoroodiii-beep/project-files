@@ -1,0 +1,316 @@
+backend\models\cars\admin\car-admin.model.js
+/*==================================================
+    CAR ADMIN MODEL
+    Administrative Operations
+==================================================*/
+
+const BaseModel = require('../../base.model');
+
+const allowedFields = require('../shared/allowed-fields');
+
+class CarAdmin extends BaseModel {
+
+    /*==============================================
+        ALLOWED UPDATE FIELDS
+    ==============================================*/
+
+    static allowedFields = allowedFields;
+
+    /*==============================================
+        CREATE CAR
+    ==============================================*/
+    static async create(data) {
+
+        const sql = `
+
+            INSERT INTO cars (
+
+                brand_id,
+
+                model,
+
+                trim,
+
+                display_title,
+
+                car_code,
+
+                slug,
+
+                \`condition\`,
+
+                status,
+
+                year,
+
+                color,
+
+                gearbox,
+
+                fuel,
+
+                engine_type,
+
+                engine_volume,
+
+                cylinders,
+
+                horsepower,
+
+                drive_type,
+
+                mileage,
+
+                price,
+
+                old_price,
+
+                currency,
+
+                price_status,
+
+                main_image,
+
+                background_image,
+
+                description,
+
+                manufacturer_url,
+
+                meta_title,
+
+                meta_description,
+
+                meta_image,
+
+                published_at,
+
+                is_active,
+
+                created_by,
+
+                updated_by
+
+            )
+
+            VALUES (
+
+                ?, ?, ?, ?,
+
+                ?, ?,
+
+                ?, ?,
+
+                ?,
+
+                ?, ?, ?,
+
+                ?, ?, ?, ?, ?, ?,
+
+                ?, ?, ?, ?,
+
+                ?, ?,
+
+                ?,
+
+                ?,
+
+                ?, ?, ?,
+
+                ?,
+
+                ?, ?, ?
+
+            )
+
+        `;
+
+        const result = await this.execute(
+
+            sql,
+
+            [
+
+                data.brand_id,
+
+                data.model,
+
+                data.trim ?? null,
+
+                data.display_title,
+
+                data.car_code,
+
+                data.slug,
+
+                data.condition,
+
+                data.status ?? 'available',
+
+                data.year,
+
+                data.color ?? null,
+
+                data.gearbox ?? null,
+
+                data.fuel ?? null,
+
+                data.engine_type ?? null,
+
+                data.engine_volume ?? null,
+
+                data.cylinders ?? null,
+
+                data.horsepower ?? null,
+
+                data.drive_type ?? null,
+
+                data.mileage ?? null,
+
+                data.price ?? null,
+
+                data.old_price ?? null,
+
+                data.currency ?? 'USD',
+
+                data.price_status ?? 'fixed',
+
+                data.main_image ?? null,
+
+                data.background_image ?? null,
+
+                data.description ?? null,
+
+                data.manufacturer_url ?? null,
+
+                data.meta_title ?? null,
+
+                data.meta_description ?? null,
+
+                data.meta_image ?? null,
+
+                data.published_at ?? null,
+
+                data.is_active ?? 1,
+
+                data.created_by ?? null,
+
+                data.updated_by ?? null
+
+            ]
+
+        );
+
+        return result.insertId;
+
+    }
+
+    /*==============================================
+        UPDATE CAR
+
+        Normal:
+            update(id, data)
+
+        Transactional:
+            update(id, data, connection)
+    ==============================================*/
+    static async update(
+        id,
+        data,
+        connection = null
+    ) {
+
+        const {
+            fields,
+            values
+        } = this.buildUpdateFields(
+            data,
+            this.allowedFields
+        );
+
+        if (fields.length === 0) {
+
+            throw new Error(
+                'No valid fields to update.'
+            );
+
+        }
+
+        values.push(id);
+
+        const sql = `
+
+            UPDATE cars
+
+            SET ${fields.join(', ')}
+
+            WHERE id = ?
+
+        `;
+
+        return this.execute(
+            sql,
+            values,
+            connection
+        );
+
+    }
+    /*==============================================
+        FIND CAR BY ID
+
+        Normal:
+            findById(id)
+
+        Transactional:
+            findById(id, connection)
+    ==============================================*/
+    static async findById(
+        id,
+        connection = null
+    ) {
+
+        const sql = `
+
+            SELECT *
+
+            FROM cars
+
+            WHERE id = ?
+
+            LIMIT 1
+
+        `;
+
+        return this.findOne(
+            sql,
+            [id],
+            connection
+        );
+
+    }
+    /*==============================================
+        DELETE CAR
+    ==============================================*/
+    static async delete(id) {
+
+        const sql = `
+
+            DELETE FROM cars
+
+            WHERE id = ?
+
+        `;
+
+        return this.execute(
+
+            sql,
+
+            [id]
+
+        );
+
+    }
+
+}
+
+module.exports = CarAdmin;
