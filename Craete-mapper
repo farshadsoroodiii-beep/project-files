@@ -1,0 +1,215 @@
+/*==================================================
+CARS CREATE MAPPER
+
+Responsible for:
+- Mapping form data to API payload
+
+Uses:
+- CarsSharedMapper
+
+No:
+- Validation
+- API calls
+- DOM manipulation
+- Submit logic
+
+Database boolean contract:
+- is_active must be mapped to 1 / 0
+
+==================================================*/
+
+const CarsCreateMapper = (() => {
+
+/*==================================================
+    TO PAYLOAD
+==================================================*/
+
+function toPayload(formData) {
+
+    return {
+
+        /*==========================================
+            BASIC INFORMATION
+        ==========================================*/
+
+        brand_id:
+            CarsSharedMapper.toNumber(
+                formData.brand_id
+            ),
+
+        model:
+            CarsSharedMapper.clean(
+                formData.model
+            ),
+
+        trim:
+            CarsSharedMapper.clean(
+                formData.trim
+            ),
+
+        display_title:
+            CarsSharedMapper.clean(
+                formData.display_title
+            ),
+
+        slug:
+            CarsSharedMapper.clean(
+                formData.slug
+            ),
+
+        year:
+            CarsSharedMapper.toNumber(
+                formData.year
+            ),
+
+        condition:
+            CarsSharedMapper.clean(
+                formData.condition
+            ),
+
+        status:
+            CarsSharedMapper.clean(
+                formData.status
+            ),
+
+        /*==========================================
+            TECHNICAL INFORMATION
+        ==========================================*/
+
+        color:
+            CarsSharedMapper.clean(
+                formData.color
+            ),
+
+        engine_type:
+            CarsSharedMapper.clean(
+                formData.engine_type
+            ),
+
+        engine_volume:
+            CarsSharedMapper.clean(
+                formData.engine_volume
+            ),
+
+        cylinders:
+            CarsSharedMapper.toNumber(
+                formData.cylinders
+            ),
+
+        horsepower:
+            CarsSharedMapper.toNumber(
+                formData.horsepower
+            ),
+
+        gearbox:
+            CarsSharedMapper.clean(
+                formData.gearbox
+            ),
+
+        drive_type:
+            CarsSharedMapper.clean(
+                formData.drive_type
+            ),
+
+        fuel:
+            CarsSharedMapper.clean(
+                formData.fuel
+            ),
+
+        mileage:
+            CarsSharedMapper.toNumber(
+                formData.mileage
+            ),
+
+        /*==========================================
+            COMMERCIAL
+        ==========================================*/
+
+        price:
+            CarsSharedMapper.toNumber(
+                formData.price
+            ),
+
+        old_price:
+            CarsSharedMapper.toNumber(
+                formData.old_price
+            ),
+
+        currency:
+            CarsSharedMapper.clean(
+                formData.currency
+            ),
+
+        price_status:
+            CarsSharedMapper.clean(
+                formData.price_status
+            ),
+
+        /*==========================================
+            DESCRIPTION
+        ==========================================*/
+
+        description:
+            CarsSharedMapper.clean(
+                formData.description
+            ),
+
+        /*==========================================
+            SEO
+        ==========================================*/
+
+        manufacturer_url:
+            CarsSharedMapper.clean(
+                formData.manufacturer_url
+            ),
+
+        meta_title:
+            CarsSharedMapper.clean(
+                formData.meta_title
+            ),
+
+        meta_description:
+            CarsSharedMapper.clean(
+                formData.meta_description
+            ),
+
+        meta_image:
+            CarsSharedMapper.cleanFile(
+                formData.meta_image
+            ),
+
+        /*==========================================
+            PUBLISH
+        ==========================================*/
+
+        published_at:
+            CarsSharedMapper.clean(
+                formData.published_at
+            ),
+
+        /*
+         * Database column `is_active` is INTEGER.
+         *
+         * FormState may contain a real Boolean:
+         *     true / false
+         *
+         * API payload must therefore contain:
+         *     1 / 0
+         *
+         * Do NOT return the Boolean directly.
+         */
+
+        is_active:
+            formData.is_active ? 1 : 0
+
+    };
+
+}
+
+return {
+
+    toPayload
+
+};
+
+})();
