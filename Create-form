@@ -1,0 +1,590 @@
+/*==================================================
+    CARS CREATE FORM
+
+    Responsible for:
+    - Form events
+    - Collecting form data
+    - Submit coordination
+    - Loading state
+    - Success handling
+    - Form reset
+
+    Delegated:
+    - Validation
+    - Mapper
+    - API
+    - Backend Error Handling
+
+    Error handling delegated to:
+    CarsCreateSubmit
+
+    Version : 2.2
+
+==================================================*/
+
+const CarsCreateForm = (() => {
+
+    let form = null;
+
+    /*==================================================
+        INIT
+    ==================================================*/
+
+    function init() {
+
+        form =
+
+            document.getElementById(
+
+                "car-create-form"
+
+            );
+
+        if (!form) {
+
+            console.error(
+
+                "Cars Create Form not found."
+
+            );
+
+            return;
+
+        }
+
+        bindEvents();
+
+        console.log(
+
+            "Cars Create Form Initialized"
+
+        );
+
+    }
+
+    /*==================================================
+        EVENTS
+    ==================================================*/
+
+    function bindEvents() {
+
+        if (
+
+            form.dataset.eventsBound
+
+        ) {
+
+            return;
+
+        }
+
+        form.dataset.eventsBound = "true";
+
+        form.addEventListener(
+
+            "submit",
+
+            handleSubmit
+
+        );
+
+        form.addEventListener(
+
+            "click",
+
+            handleActionClick
+
+        );
+
+        bindSlugGenerator();
+
+    }
+
+    /*==================================================
+        SLUG GENERATOR
+    ==================================================*/
+
+    function bindSlugGenerator() {
+
+        const titleInput =
+
+            form.querySelector(
+
+                "#display_title"
+
+            );
+
+        const slugInput =
+
+            form.querySelector(
+
+                "#slug"
+
+            );
+
+        if (
+
+            !titleInput ||
+
+            !slugInput
+
+        ) {
+
+            return;
+
+        }
+
+        titleInput.addEventListener(
+
+            "input",
+
+            () => {
+
+                if (
+
+                    slugInput.dataset.manual === "true"
+
+                ) {
+
+                    return;
+
+                }
+
+                if (
+
+                    typeof SlugGenerator === "undefined"
+
+                ) {
+
+                    console.warn(
+
+                        "SlugGenerator is not loaded."
+
+                    );
+
+                    return;
+
+                }
+
+                slugInput.value =
+
+                    SlugGenerator.generate(
+
+                        titleInput.value
+
+                    );
+
+            }
+
+        );
+
+        slugInput.addEventListener(
+
+            "input",
+
+            () => {
+
+                slugInput.dataset.manual =
+
+                    "true";
+
+            }
+
+        );
+
+    }
+
+    /*==================================================
+        ACTION BUTTONS
+    ==================================================*/
+
+    function handleActionClick(event) {
+
+        if (
+
+            typeof FormState === "undefined"
+
+        ) {
+
+            console.error(
+
+                "FormState is not loaded."
+
+            );
+
+            return;
+
+        }
+
+        if (
+
+            FormState.isLoading()
+
+        ) {
+
+            return;
+
+        }
+
+        const button =
+
+            event.target.closest(
+
+                "[data-action]"
+
+            );
+
+        if (!button) {
+
+            return;
+
+        }
+
+        const action =
+
+            button.dataset.action;
+
+        switch(action) {
+
+            case "cancel":
+
+                handleCancel();
+
+                break;
+
+            case "save-continue":
+
+                FormState.setSubmitMode(
+
+                    "save-continue"
+
+                );
+
+                break;
+
+            case "save":
+
+                FormState.setSubmitMode(
+
+                    "save"
+
+                );
+
+                break;
+
+        }
+
+    }
+
+    /*==================================================
+        SUBMIT
+    ==================================================*/
+
+    async function handleSubmit(event) {
+
+        if (
+
+            typeof CarsCreateSubmit === "undefined"
+
+        ) {
+
+            event.preventDefault();
+
+            console.error(
+
+                "CarsCreateSubmit is not loaded."
+
+            );
+
+            return;
+
+        }
+
+        await CarsCreateSubmit.submit(
+
+            event,
+
+            {
+
+                form,
+
+                setLoading,
+
+                onSuccess: handleSuccess
+
+            }
+
+        );
+
+    }
+
+    /*==================================================
+        LOADING STATE
+    ==================================================*/
+
+    function setLoading(status) {
+
+        if (
+
+            typeof FormState === "undefined"
+
+        ) {
+
+            console.error(
+
+                "FormState is not loaded."
+
+            );
+
+            return;
+
+        }
+
+        FormState.setLoading(
+
+            status
+
+        );
+
+        if (
+
+            typeof FormUI !== "undefined"
+
+        ) {
+
+            FormUI.setLoading(
+
+                form,
+
+                status
+
+            );
+
+        }
+
+    }
+
+    /*==================================================
+        SUCCESS
+    ==================================================*/
+
+    function handleSuccess(response) {
+
+        console.log(
+
+            "Car created successfully:",
+
+            response
+
+        );
+
+        if (
+
+            typeof FormState === "undefined"
+
+        ) {
+
+            console.error(
+
+                "FormState is not loaded."
+
+            );
+
+            return;
+
+        }
+
+        if (
+
+            FormState.getSubmitMode() === "save-continue"
+
+        ) {
+
+            if (
+
+                typeof Notification !== "undefined"
+
+            ) {
+
+                Notification.success(
+
+                    "خودرو با موفقیت ثبت شد. آماده ثبت خودروی بعدی هستید."
+
+                );
+
+            }
+
+            resetForm();
+
+            return;
+
+        }
+
+        /*
+            Successful Create is complete.
+
+            Release Create Images resources
+            before leaving the Create route.
+        */
+
+        if (
+
+            typeof CarsCreateImages !== "undefined"
+
+        ) {
+
+            CarsCreateImages.reset();
+
+        }
+
+        sessionStorage.setItem(
+
+            "admin_notification",
+
+            JSON.stringify({
+
+                type:
+
+                    "success",
+
+                message:
+
+                    "خودرو با موفقیت ثبت شد."
+
+            })
+
+        );
+
+        window.location.hash =
+
+            "#/cars";
+
+    }
+
+    /*==================================================
+        CANCEL
+    ==================================================*/
+
+    function handleCancel() {
+
+        if (
+
+            typeof FormState === "undefined"
+
+        ) {
+
+            console.error(
+
+                "FormState is not loaded."
+
+            );
+
+            return;
+
+        }
+
+        if (
+
+            FormState.isLoading()
+
+        ) {
+
+            return;
+
+        }
+
+        const confirmCancel =
+
+            confirm(
+
+                "آیا از لغو ثبت خودرو مطمئن هستید؟"
+
+            );
+
+        if (!confirmCancel) {
+
+            return;
+
+        }
+
+        resetForm();
+
+    }
+
+    /*==================================================
+        RESET
+    ==================================================*/
+
+    function resetForm() {
+
+        if (!form) {
+
+            return;
+
+        }
+
+        form.reset();
+
+        if (
+
+            typeof FormState !== "undefined"
+
+        ) {
+
+            FormState.reset();
+
+        }
+
+        if (
+
+            typeof CarsCreateImages !== "undefined"
+
+        ) {
+
+            CarsCreateImages.reset();
+
+        }
+
+        const slugInput =
+
+            form.querySelector(
+
+                "#slug"
+
+            );
+
+        if (slugInput) {
+
+            delete slugInput.dataset.manual;
+
+        }
+
+        if (
+
+            typeof FormErrorManager !== "undefined"
+
+        ) {
+
+            FormErrorManager.clear();
+
+        }
+
+        console.log(
+
+            "Cars Create Form Reset"
+
+        );
+
+    }
+
+    /*==================================================
+        PUBLIC
+    ==================================================*/
+
+    return {
+
+        init
+
+    };
+
+})();
