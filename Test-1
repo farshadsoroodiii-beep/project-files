@@ -1,0 +1,32 @@
+'projectcar'
+
+'inventory_items'
+
+'inventory_reservations'
+
+'id', 'int unsigned', 'NO', 'PRI', NULL, 'auto_increment'
+'car_id', 'int unsigned', 'NO', 'UNI', NULL, ''
+'status', 'varchar(32)', 'NO', 'MUL', 'AVAILABLE', ''
+'sold_at', 'datetime(6)', 'YES', '', NULL, ''
+'created_at', 'datetime(6)', 'NO', '', 'CURRENT_TIMESTAMP(6)', 'DEFAULT_GENERATED'
+'updated_at', 'datetime(6)', 'NO', '', 'CURRENT_TIMESTAMP(6)', 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP(6)'
+
+
+'id', 'int unsigned', 'NO', 'PRI', NULL, 'auto_increment'
+'inventory_item_id', 'int unsigned', 'NO', 'MUL', NULL, ''
+'customer_id', 'int unsigned', 'YES', 'MUL', NULL, ''
+'cart_id', 'int unsigned', 'YES', 'MUL', NULL, ''
+'checkout_id', 'int unsigned', 'YES', 'MUL', NULL, ''
+'status', 'varchar(32)', 'NO', 'MUL', 'ACTIVE', ''
+'reserved_at', 'datetime(6)', 'NO', '', 'CURRENT_TIMESTAMP(6)', 'DEFAULT_GENERATED'
+'expires_at', 'datetime(6)', 'NO', '', NULL, ''
+'released_at', 'datetime(6)', 'YES', '', NULL, ''
+'converted_at', 'datetime(6)', 'YES', '', NULL, ''
+'created_at', 'datetime(6)', 'NO', '', 'CURRENT_TIMESTAMP(6)', 'DEFAULT_GENERATED'
+'updated_at', 'datetime(6)', 'NO', '', 'CURRENT_TIMESTAMP(6)', 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP(6)'
+
+
+'inventory_items', 'CREATE TABLE `inventory_items` (\n  `id` int unsigned NOT NULL AUTO_INCREMENT,\n  `car_id` int unsigned NOT NULL,\n  `status` varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT \'AVAILABLE\',\n  `sold_at` datetime(6) DEFAULT NULL,\n  `created_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),\n  `updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_inventory_items_car_id` (`car_id`),\n  KEY `idx_inventory_items_status` (`status`),\n  KEY `idx_inventory_items_status_car` (`status`,`car_id`),\n  CONSTRAINT `fk_inventory_items_car` FOREIGN KEY (`car_id`) REFERENCES `cars` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+
+
+'inventory_reservations', 'CREATE TABLE `inventory_reservations` (\n  `id` int unsigned NOT NULL AUTO_INCREMENT,\n  `inventory_item_id` int unsigned NOT NULL,\n  `customer_id` int unsigned DEFAULT NULL,\n  `cart_id` int unsigned DEFAULT NULL,\n  `checkout_id` int unsigned DEFAULT NULL,\n  `status` varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT \'ACTIVE\',\n  `reserved_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),\n  `expires_at` datetime(6) NOT NULL,\n  `released_at` datetime(6) DEFAULT NULL,\n  `converted_at` datetime(6) DEFAULT NULL,\n  `created_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),\n  `updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),\n  PRIMARY KEY (`id`),\n  KEY `idx_reservations_inventory_status` (`inventory_item_id`,`status`),\n  KEY `idx_reservations_expiration` (`status`,`expires_at`),\n  KEY `idx_reservations_cart_status` (`cart_id`,`status`),\n  KEY `idx_reservations_checkout_status` (`checkout_id`,`status`),\n  KEY `idx_reservations_customer_status` (`customer_id`,`status`),\n  CONSTRAINT `fk_reservations_cart` FOREIGN KEY (`cart_id`) REFERENCES `carts` (`id`) ON DELETE SET NULL ON UPDATE CASCADE,\n  CONSTRAINT `fk_reservations_checkout` FOREIGN KEY (`checkout_id`) REFERENCES `checkouts` (`id`) ON DELETE SET NULL ON UPDATE CASCADE,\n  CONSTRAINT `fk_reservations_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`) ON DELETE SET NULL ON UPDATE CASCADE,\n  CONSTRAINT `fk_reservations_inventory` FOREIGN KEY (`inventory_item_id`) REFERENCES `inventory_items` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
